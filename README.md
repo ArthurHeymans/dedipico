@@ -118,8 +118,9 @@ Supported commands: `TRANSCEIVE`, `READ`, `WRITE`, `SET_VCC`, `SET_SPI_CLK`,
   flash read takes ~11 s instead of ~0.3 s. Functionally identical, just slower.
 - **Single I/O only.** Dual/Quad SPI would require PIO; the RP2040 hardware SPI
   peripheral only supports standard 1-1-1 mode.
-- **SPI clock speed switching** is accepted but not yet applied at runtime.
-  The SPI bus runs at a fixed 12 MHz.
+- **SPI clock speed switching** is fully supported. The bus defaults to 30 MHz
+  and is reconfigured at runtime when flashprog sends `SET_SPI_CLK` (e.g.
+  `spispeed=12M`).
 - **No voltage switching.** The Pico's 3V3 rail is always on. `SET_VCC` is
   acknowledged but does not control power.
 
