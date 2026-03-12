@@ -78,9 +78,9 @@ async fn main(spawner: Spawner) {
     spi_config.polarity = spi::Polarity::IdleLow;
 
     let spi: Spi<'static, SPI0, spi::Async> = Spi::new(
-        p.SPI0, p.PIN_18, p.PIN_19, p.PIN_16, p.DMA_CH0, p.DMA_CH1, spi_config,
+        p.SPI0, p.PIN_2, p.PIN_3, p.PIN_4, p.DMA_CH0, p.DMA_CH1, spi_config,
     );
-    let cs = Output::new(p.PIN_17, Level::High); // CS deasserted (high)
+    let cs = Output::new(p.PIN_5, Level::High); // CS deasserted (high)
 
     // Store in shared state
     critical_section::with(|cs_tok| {

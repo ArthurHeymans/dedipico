@@ -14,10 +14,10 @@ as a USB-to-SPI flash programmer.
 
 | Function       | Pico Pin | GPIO |
 |----------------|----------|------|
-| SPI SCK        | 24       | GP18 |
-| SPI MOSI (IO0) | 25       | GP19 |
-| SPI MISO (IO1) | 21       | GP16 |
-| SPI CS#        | 22       | GP17 |
+| SPI SCK        | 4        | GP2  |
+| SPI MOSI (IO0) | 5        | GP3  |
+| SPI MISO (IO1) | 6        | GP4  |
+| SPI CS#        | 7        | GP5  |
 
 ### LEDs (active-high)
 
@@ -32,10 +32,10 @@ as a USB-to-SPI flash programmer.
 ```
             Raspberry Pi Pico
            ┌─────────────────┐
-           │              GP18├──── SCK
-           │              GP19├──── MOSI
-           │              GP16├──── MISO
-           │              GP17├──── CS#
+           │               GP2├──── SCK
+           │               GP3├──── MOSI
+           │               GP4├──── MISO
+           │               GP5├──── CS#
            │                  │
            │              GP25├──── Pass LED (onboard)
            │              GP14├──── Busy LED
