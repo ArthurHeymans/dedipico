@@ -19,6 +19,8 @@ static_cell = "2"
 portable-atomic = { version = "1", features = ["critical-section"] }
 embedded-hal = "1.0"
 critical-section = "1.2.0"
+pio = "0.3"
+fixed = "1"
 
 [profile.release]
 debug = 2

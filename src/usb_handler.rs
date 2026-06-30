@@ -235,6 +235,12 @@ impl DediprogHandler {
         } else {
             None
         };
+        let dummy_cycles = if mode_byte.is_some() {
+            let mode_byte_cycles = 8 / io_mode.address_width();
+            setup.dummy_cycles.saturating_sub(mode_byte_cycles)
+        } else {
+            setup.dummy_cycles
+        };
 
         info!(
             "READ setup: addr=0x{:08x} blocks={} opcode=0x{:02x} mode={} io_mode={} addr_len={} dummy_cycles={}",
@@ -244,7 +250,7 @@ impl DediprogHandler {
             setup.mode_byte,
             io_mode,
             setup.addr_len,
-            setup.dummy_cycles
+            dummy_cycles
         );
 
         let op = BulkOperation::Read {
@@ -254,7 +260,7 @@ impl DediprogHandler {
             addr_len: setup.addr_len,
             io_mode,
             mode_byte,
-            dummy_cycles: setup.dummy_cycles,
+            dummy_cycles,
         };
         critical_section::with(|cs| {
             *BULK_OP.borrow(cs).borrow_mut() = Some(op);

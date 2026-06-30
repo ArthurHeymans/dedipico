@@ -126,13 +126,14 @@ Supported commands: `TRANSCEIVE`, `READ`, `WRITE`, `SET_VCC`, `SET_SPI_CLK`,
 
 - **Full Speed USB only** (12 Mbit/s vs 480 Mbit/s on a real SF600). A 16 MiB
   flash read takes ~11 s instead of ~0.3 s. Functionally identical, just slower.
-- **Multi-I/O reads are supported by a GPIO bit-bang engine.** `iomode=dual`
+- **Multi-I/O reads are supported by a PIO + DMA engine.** `iomode=dual`
   and `iomode=quad` exercise Dediprog/flashprog's 1-1-2, 1-2-2, 1-1-4, and
-  1-4-4 read paths. This is functionally useful, but not the final high-speed
-  PIO/DMA implementation.
-- **SPI clock speed switching is approximate.** The bit-bang engine inserts
-  delay NOPs for lower requested speeds, but method-call overhead dominates at
-  high speeds. Treat `spispeed=` as a signal-integrity knob, not an exact clock.
+  1-4-4 read paths. All flash traffic, including 1-1-1 commands, uses PIO
+  rather than the RP2040 PL022 SPI block. Bulk reads use DMA for both the RX
+  FIFO and the per-byte clock tokens.
+- **SPI clock speed switching is supported by the PIO clock divider.** The bus
+  defaults to 30 MHz and is reconfigured at runtime when flashprog sends
+  `SET_SPI_CLK` (e.g. `spispeed=12M`).
 - **No voltage switching.** The Pico's 3V3 rail is always on. `SET_VCC` is
   acknowledged but does not control power.
 
@@ -143,7 +144,7 @@ src/
 ├── main.rs           Entry point, USB + flash-bus init, bulk worker task
 ├── usb_handler.rs    embassy_usb::Handler — dispatches CMD_* control transfers
 ├── protocol.rs       Command codes, enums, V2/V3 packet parsing
-├── spi_flash.rs      Lane-aware GPIO flash ops (single, dual, quad reads)
+├── spi_flash.rs      PIO + DMA flash ops (single, dual, quad reads)
 ├── leds.rs           GPIO LED driver
 └── config.rs         Device identity, constants
 ```

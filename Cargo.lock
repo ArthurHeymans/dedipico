@@ -264,7 +264,9 @@ dependencies = [
  "embassy-time",
  "embassy-usb",
  "embedded-hal 1.0.0",
+ "fixed",
  "panic-probe",
+ "pio",
  "portable-atomic",
  "static_cell",
 ]

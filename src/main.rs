@@ -14,9 +14,10 @@ use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
-use embassy_rp::gpio::{Flex, Level, Output};
-use embassy_rp::peripherals::USB;
-use embassy_rp::usb::{Driver, InterruptHandler};
+use embassy_rp::gpio::{Level, Output};
+use embassy_rp::peripherals::{PIO0, USB};
+use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
+use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_sync::zerocopy_channel::Channel;
@@ -38,7 +39,8 @@ use crate::usb_handler::DediprogHandler;
 // =============================================================================
 
 bind_interrupts!(struct Irqs {
-    USBCTRL_IRQ => InterruptHandler<USB>;
+    USBCTRL_IRQ => UsbInterruptHandler<USB>;
+    PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
 });
 
 // =============================================================================
@@ -79,16 +81,14 @@ async fn main(spawner: Spawner) {
     //   GP5  = IO2 / WP#
     //   GP6  = IO3 / HOLD#
     //   GP7  = CS#
-    let io0 = Flex::new(p.PIN_3);
-    let io1 = Flex::new(p.PIN_4);
-    let io2 = Flex::new(p.PIN_5);
-    let io3 = Flex::new(p.PIN_6);
-    let sck = Output::new(p.PIN_2, Level::Low);
+    let pio = Pio::new(p.PIO0, Irqs);
     let cs = Output::new(p.PIN_7, Level::High); // CS deasserted (high)
 
     // Store in shared state
     critical_section::with(|cs_tok| {
-        *SPI_FLASH.borrow(cs_tok).borrow_mut() = Some(SpiFlash::new(io0, io1, io2, io3, sck, cs));
+        *SPI_FLASH.borrow(cs_tok).borrow_mut() = Some(SpiFlash::new(
+            pio, p.DMA_CH0, p.DMA_CH1, p.PIN_3, p.PIN_4, p.PIN_5, p.PIN_6, p.PIN_2, cs,
+        ));
     });
 
     // ---- LEDs ----
@@ -167,7 +167,7 @@ async fn usb_device_task(mut usb: embassy_usb::UsbDevice<'static, UsbDriver>) {
 }
 
 // =============================================================================
-// Bulk worker task — handles bulk read/write operations using SPI + DMA
+// Bulk worker task — handles bulk read/write operations using the PIO flash bus
 // =============================================================================
 
 #[embassy_executor::task]
@@ -185,7 +185,7 @@ async fn bulk_worker_task(
             continue;
         };
 
-        // Take the SPI peripheral out of shared state for exclusive async use.
+        // Take the flash bus out of shared state for exclusive async use.
         let flash = critical_section::with(|cs| SPI_FLASH.borrow(cs).borrow_mut().take());
         let Some(mut flash) = flash else {
             error!("SPI flash not available for bulk operation");
@@ -316,7 +316,7 @@ async fn bulk_worker_task(
             }
         }
 
-        // Return the SPI peripheral to shared state so the handler can use it.
+        // Return the flash bus to shared state so the handler can use it.
         critical_section::with(|cs| {
             *SPI_FLASH.borrow(cs).borrow_mut() = Some(flash);
         });
