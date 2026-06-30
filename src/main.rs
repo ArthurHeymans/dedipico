@@ -8,6 +8,7 @@ mod spi_flash;
 mod usb_handler;
 
 use core::cell::RefCell;
+use core::sync::atomic::{compiler_fence, Ordering};
 
 use critical_section::Mutex;
 use defmt::*;
@@ -15,15 +16,14 @@ use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Level, Output};
+use embassy_rp::pac;
 use embassy_rp::peripherals::{PIO0, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_sync::zerocopy_channel::Channel;
-use embassy_usb::driver::{
-    Direction, Endpoint as _, EndpointAddress, EndpointIn as _, EndpointOut as _,
-};
+use embassy_usb::driver::{Direction, Endpoint as _, EndpointAddress, EndpointOut as _};
 use embassy_usb::Builder;
 use panic_probe as _;
 use static_cell::StaticCell;
@@ -219,6 +219,7 @@ async fn bulk_worker_task(
                 let mut channel =
                     Channel::<CriticalSectionRawMutex, [u8; BULK_BLOCK_SIZE]>::new(&mut buf);
                 let (mut sender, mut receiver) = channel.split();
+                let mut fast_in = FastBulkIn::new_ep2();
 
                 let ((), usb_result) = embassy_futures::join::join(
                     // SPI producer: DMA-read blocks directly into channel slots
@@ -236,7 +237,7 @@ async fn bulk_worker_task(
                             {
                                 let slot = receiver.receive().await;
                                 if result.is_ok() {
-                                    if let Err(e) = write_bulk_block(&mut ep_in, slot).await {
+                                    if let Err(e) = write_bulk_block(&mut fast_in, slot).await {
                                         error!("Bulk IN write error at block {}", i);
                                         result = Err(e);
                                     }
@@ -334,13 +335,98 @@ async fn bulk_worker_task(
 // Bulk endpoint helpers — read/write 512-byte blocks in max-packet chunks
 // =============================================================================
 
+/// Fast writer for the fixed DediProg bulk-IN endpoint (EP2 IN / 0x82).
+///
+/// Embassy's generic RP2040 USB endpoint driver uses one 64-byte DPRAM buffer per
+/// endpoint. Full-speed bulk can use more bus slots if the device can pre-arm the
+/// next packet while the current one is in flight, so this path enables RP2040's
+/// double-buffered endpoint mode for EP2 IN and alternates both 64-byte buffers.
+/// The protocol endpoint number is not dynamic: flashprog/dediprog always reads
+/// bulk data from EP2 IN, and `main()` allocates EP1 OUT then EP2 IN, giving EP2
+/// buffer 0 the same 0x1c0 DPRAM address Embassy assigned originally.
+struct FastBulkIn {
+    next_buf: usize,
+    next_pid: bool,
+}
+
+impl FastBulkIn {
+    const EP_INDEX: usize = 2;
+    const EP_CONTROL_INDEX: usize = Self::EP_INDEX - 1;
+    const DPRAM_BUFFER0_ADDR: usize = 0x1c0;
+    const BUFFER_STRIDE: usize = USB_MAX_PACKET_SIZE as usize;
+
+    fn new_ep2() -> Self {
+        let dpram = pac::USB_DPRAM;
+        dpram.ep_in_control(Self::EP_CONTROL_INDEX).modify(|w| {
+            w.set_buffer_address(Self::DPRAM_BUFFER0_ADDR as u16);
+            w.set_endpoint_type(pac::usb_dpram::vals::EpControlEndpointType::BULK);
+            w.set_interrupt_per_buff(true);
+            w.set_interrupt_per_double_buff(false);
+            w.set_double_buffered(true);
+            w.set_enable(true);
+        });
+        dpram.ep_in_buffer_control(Self::EP_INDEX).write(|w| {
+            w.set_reset(true);
+            w.set_pid(0, true);
+            w.set_pid(1, false);
+        });
+
+        Self {
+            next_buf: 0,
+            // Matches Embassy's first-packet behavior after endpoint enable: it
+            // stores `pid = !current_pid`, where current_pid starts true.
+            next_pid: false,
+        }
+    }
+
+    async fn write_packet(&mut self, packet: &[u8]) {
+        let dpram = pac::USB_DPRAM;
+        let buf_index = self.next_buf;
+
+        while dpram
+            .ep_in_buffer_control(Self::EP_INDEX)
+            .read()
+            .available(buf_index)
+        {
+            embassy_futures::yield_now().await;
+        }
+
+        compiler_fence(Ordering::SeqCst);
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(
+                (pac::USB_DPRAM.as_ptr() as *mut u8)
+                    .add(Self::DPRAM_BUFFER0_ADDR + buf_index * Self::BUFFER_STRIDE),
+                packet.len(),
+            )
+        };
+        dst.copy_from_slice(packet);
+        compiler_fence(Ordering::SeqCst);
+
+        dpram.ep_in_buffer_control(Self::EP_INDEX).modify(|w| {
+            w.set_length(buf_index, packet.len() as u16);
+            w.set_pid(buf_index, self.next_pid);
+            w.set_full(buf_index, true);
+        });
+        cortex_m::asm::delay(12);
+        dpram.ep_in_buffer_control(Self::EP_INDEX).modify(|w| {
+            w.set_length(buf_index, packet.len() as u16);
+            w.set_pid(buf_index, self.next_pid);
+            w.set_full(buf_index, true);
+            w.set_available(buf_index, true);
+        });
+
+        self.next_pid = !self.next_pid;
+        self.next_buf ^= 1;
+    }
+}
+
 /// Write a full 512-byte block to the bulk IN endpoint (8 × 64-byte packets).
 async fn write_bulk_block(
-    ep: &mut <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointIn,
+    fast_in: &mut FastBulkIn,
     data: &[u8; BULK_BLOCK_SIZE],
 ) -> Result<(), embassy_usb::driver::EndpointError> {
     for chunk in data.chunks(USB_MAX_PACKET_SIZE as usize) {
-        ep.write(chunk).await?;
+        fast_in.write_packet(chunk).await;
     }
     Ok(())
 }

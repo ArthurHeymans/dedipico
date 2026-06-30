@@ -2,7 +2,8 @@
 
 Dediprog SF600 protocol emulation on a Raspberry Pi Pico (RP2040), written in
 Rust with Embassy. Lets you use `flashprog` (or `flashrom`) with a $4 Pico
-as a USB-to-SPI flash programmer.
+as a USB-to-SPI flash programmer. The flash bus is implemented entirely with
+RP2040 PIO so the same engine can handle single, dual, and quad SPI phases.
 
 ```
 [Host PC: flashprog] --USB--> [Raspberry Pi Pico] --SPI--> [SPI Flash Chip]
@@ -21,13 +22,17 @@ as a USB-to-SPI flash programmer.
 | SPI IO3 / HOLD# | 9        | GP6  |
 | SPI CS#         | 10       | GP7  |
 
+The SPI bus uses PIO0. Keep IO0 through IO3 on consecutive GPIOs (GP3-GP6);
+the PIO programs switch those pins between output and input for 1-1-1, 1-1-2,
+1-2-2, 1-1-4, and 1-4-4 transactions.
+
 ### LEDs (active-high)
 
-| Function  | Pico Pin | GPIO |
-|-----------|----------|------|
+| Function  | Pico Pin     | GPIO |
+|-----------|--------------|------|
 | LED Pass  | 25 (onboard) | GP25 |
-| LED Busy  | 19       | GP14 |
-| LED Error | 20       | GP15 |
+| LED Busy  | 19           | GP14 |
+| LED Error | 20           | GP15 |
 
 ### Wiring diagram
 
@@ -119,21 +124,23 @@ USB VID:PID `0483:DADA` with:
 - EP2 IN (`0x82`) — bulk read data to host
 
 Supported commands: `TRANSCEIVE`, `READ`, `WRITE`, `SET_VCC`, `SET_SPI_CLK`,
-`SET_TARGET`, `SET_IO_LED`, `SET_STANDALONE`, `IO_MODE`, `READ_PROG_INFO`,
-`READ_EEPROM`, and various stubs (`SET_VPP`, `SET_HOLD`, `GET_BUTTON`, etc.).
+`SET_TARGET`, `SET_IO_LED`, `SET_STANDALONE`, `IO_MODE`, `SET_CS`,
+`READ_PROG_INFO`, `READ_EEPROM`, `SET_VOLTAGE` legacy reads, and various stubs
+(`SET_VPP`, `SET_HOLD`, `GET_BUTTON`, `GET_UID`, `READ_FPGA_VERSION`,
+`CHECK_SOCKET`, etc.).
 
 ## Limitations
 
 - **Full Speed USB only** (12 Mbit/s vs 480 Mbit/s on a real SF600). A 16 MiB
   flash read takes ~11 s instead of ~0.3 s. Functionally identical, just slower.
-- **Multi-I/O reads are supported by a PIO + DMA engine.** `iomode=dual`
-  and `iomode=quad` exercise Dediprog/flashprog's 1-1-2, 1-2-2, 1-1-4, and
-  1-4-4 read paths. All flash traffic, including 1-1-1 commands, uses PIO
-  rather than the RP2040 PL022 SPI block. Bulk reads use DMA for both the RX
-  FIFO and the per-byte clock tokens.
+- **All SPI traffic uses the PIO flash engine.** `iomode=dual` and
+  `iomode=quad` exercise Dediprog/flashprog's 1-1-2, 1-2-2, 1-1-4, and 1-4-4
+  read paths. Classic 1-1-1 commands and page programs also use PIO rather than
+  the RP2040 PL022 SPI block. Bulk reads use DMA for both the RX FIFO and the
+  per-byte clock tokens.
 - **SPI clock speed switching is supported by the PIO clock divider.** The bus
-  defaults to 30 MHz and is reconfigured at runtime when flashprog sends
-  `SET_SPI_CLK` (e.g. `spispeed=12M`).
+  defaults to 24 MHz, caps requested speeds at 24 MHz, and is reconfigured at
+  runtime when flashprog sends `SET_SPI_CLK` (e.g. `spispeed=12M`).
 - **No voltage switching.** The Pico's 3V3 rail is always on. `SET_VCC` is
   acknowledged but does not control power.
 
@@ -144,7 +151,7 @@ src/
 ├── main.rs           Entry point, USB + flash-bus init, bulk worker task
 ├── usb_handler.rs    embassy_usb::Handler — dispatches CMD_* control transfers
 ├── protocol.rs       Command codes, enums, V2/V3 packet parsing
-├── spi_flash.rs      PIO + DMA flash ops (single, dual, quad reads)
+├── spi_flash.rs      All-PIO + DMA flash ops (single writes; single/dual/quad reads)
 ├── leds.rs           GPIO LED driver
 └── config.rs         Device identity, constants
 ```
