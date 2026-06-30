@@ -1,156 +1,315 @@
-/// SPI flash operations — blocking (for transceive) and async (for bulk).
-use embassy_rp::gpio::Output;
-use embassy_rp::spi::{Async, Spi};
-use embassy_rp::peripherals::SPI0;
+/// SPI flash operations over a lane-aware GPIO bus.
+///
+/// The RP2040 PL022 SPI block only supports classic 1-1-1 SPI. This GPIO
+/// transport keeps the command/write/status paths single-lane, but can switch
+/// the bulk-read address/data phases to Dediprog's dual/quad modes:
+/// 1-1-2, 1-2-2, 1-1-4 and 1-4-4.
+use cortex_m::asm;
+use embassy_rp::gpio::{Flex, Level, Output, Pull};
 
 use crate::config;
+use crate::protocol::IoMode;
 
 pub struct SpiFlash<'d> {
-    pub spi: Spi<'d, SPI0, Async>,
-    pub cs: Output<'d>,
+    io0: Flex<'d>,
+    io1: Flex<'d>,
+    io2: Flex<'d>,
+    io3: Flex<'d>,
+    sck: Output<'d>,
+    cs: Output<'d>,
+    half_period_nops: u16,
 }
 
 impl<'d> SpiFlash<'d> {
-    pub fn new(spi: Spi<'d, SPI0, Async>, cs: Output<'d>) -> Self {
-        Self { spi, cs }
+    pub fn new(
+        mut io0: Flex<'d>,
+        mut io1: Flex<'d>,
+        mut io2: Flex<'d>,
+        mut io3: Flex<'d>,
+        mut sck: Output<'d>,
+        mut cs: Output<'d>,
+    ) -> Self {
+        io0.set_pull(Pull::None);
+        io1.set_pull(Pull::None);
+        io2.set_pull(Pull::Up);
+        io3.set_pull(Pull::Up);
+
+        sck.set_low();
+        cs.set_high();
+
+        let mut this = Self {
+            io0,
+            io1,
+            io2,
+            io3,
+            sck,
+            cs,
+            half_period_nops: 0,
+        };
+        this.idle_io();
+        this.set_frequency(config::DEFAULT_SPI_FREQ_HZ);
+        this
     }
 
     // =========================================================================
-    // Runtime SPI clock reconfiguration
+    // Runtime bus clock approximation
     // =========================================================================
 
-    /// Change the SPI bus frequency by writing the PL022 prescaler registers
-    /// directly.  `freq_hz` is the desired clock; the actual clock will be the
-    /// closest achievable value that does not exceed it.
+    /// Set an approximate bit-bang half-period. GPIO method-call overhead is a
+    /// large part of the real period, so high requested speeds intentionally map
+    /// to zero extra NOPs. Slower flashprog `spispeed=` values still get extra
+    /// spacing and are useful for marginal wiring.
     pub fn set_frequency(&mut self, freq_hz: u32) {
-        // RP2040 peripheral clock — 125 MHz at default clocks.
-        let peri_clk: u32 = 125_000_000;
-
-        // PL022 baud = peri_clk / (CPSDVSR * (1 + SCR))
-        //   CPSDVSR: even, 2..=254
-        //   SCR:     0..=255
-        let (cpsdvsr, scr) = Self::calc_prescalers(peri_clk, freq_hz);
-
-        let spi0 = embassy_rp::pac::SPI0;
-        spi0.cpsr().write(|w| w.set_cpsdvsr(cpsdvsr));
-        spi0.cr0().modify(|w| w.set_scr(scr));
+        let freq_hz = freq_hz.max(1);
+        let ideal_half_cycles = 125_000_000u32 / freq_hz / 2;
+        self.half_period_nops = ideal_half_cycles.saturating_sub(16).min(u16::MAX as u32) as u16;
     }
 
-    fn calc_prescalers(peri_clk: u32, target: u32) -> (u8, u8) {
-        // Walk even prescaler values, pick the combination whose actual
-        // frequency is the highest that doesn't exceed `target`.
-        let mut best_cpsdvsr: u8 = 254;
-        let mut best_scr: u8 = 255;
-
-        let mut cpsdvsr: u32 = 2;
-        while cpsdvsr <= 254 {
-            // scr = ceil(peri_clk / (cpsdvsr * target)) - 1, clamped
-            let divisor = cpsdvsr * target;
-            if divisor == 0 {
-                cpsdvsr += 2;
-                continue;
-            }
-            let scr = peri_clk.div_ceil(divisor);
-            let scr = if scr == 0 { 0 } else { scr - 1 };
-            if scr <= 255 {
-                best_cpsdvsr = cpsdvsr as u8;
-                best_scr = scr as u8;
-                break; // first valid pair is the fastest ≤ target
-            }
-            cpsdvsr += 2;
+    #[inline(always)]
+    fn delay_half_period(&self) {
+        for _ in 0..self.half_period_nops {
+            asm::nop();
         }
-
-        (best_cpsdvsr, best_scr)
     }
 
     // =========================================================================
-    // CS control
+    // CS and idle pin control
     // =========================================================================
 
     #[inline]
     pub fn cs_assert(&mut self) {
+        self.sck.set_low();
         self.cs.set_low();
     }
 
     #[inline]
     pub fn cs_deassert(&mut self) {
+        self.sck.set_low();
         self.cs.set_high();
+        self.idle_io();
+    }
+
+    fn idle_io(&mut self) {
+        // IO0 idles low as MOSI. IO1 is MISO. IO2/IO3 are /WP and /HOLD in
+        // single-lane mode, so keep them high unless a multi-I/O transaction
+        // temporarily takes ownership of the lanes.
+        self.io0.set_low();
+        self.io0.set_as_output();
+        self.io1.set_as_input();
+        self.io2.set_high();
+        self.io2.set_as_output();
+        self.io3.set_high();
+        self.io3.set_as_output();
+    }
+
+    fn set_lane_dirs(&mut self, width: u8, output: bool) {
+        if output {
+            self.io0.set_as_output();
+            if width >= 2 {
+                self.io1.set_as_output();
+            } else {
+                self.io1.set_as_input();
+            }
+            if width >= 4 {
+                self.io2.set_as_output();
+                self.io3.set_as_output();
+            } else {
+                self.io2.set_high();
+                self.io2.set_as_output();
+                self.io3.set_high();
+                self.io3.set_as_output();
+            }
+        } else {
+            self.io0.set_as_input();
+            self.io1.set_as_input();
+            if width >= 4 {
+                self.io2.set_as_input();
+                self.io3.set_as_input();
+            } else {
+                // Not participating in dual-output reads. Hold legacy /WP and
+                // /HOLD high.
+                self.io2.set_high();
+                self.io2.set_as_output();
+                self.io3.set_high();
+                self.io3.set_as_output();
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn set_lane_values(&mut self, value: u8, width: u8) {
+        self.io0.set_level(if value & 0x1 != 0 {
+            Level::High
+        } else {
+            Level::Low
+        });
+        if width >= 2 {
+            self.io1.set_level(if value & 0x2 != 0 {
+                Level::High
+            } else {
+                Level::Low
+            });
+        }
+        if width >= 4 {
+            self.io2.set_level(if value & 0x4 != 0 {
+                Level::High
+            } else {
+                Level::Low
+            });
+            self.io3.set_level(if value & 0x8 != 0 {
+                Level::High
+            } else {
+                Level::Low
+            });
+        }
+    }
+
+    #[inline(always)]
+    fn read_lane_values(&self, width: u8) -> u8 {
+        if width == 1 {
+            return if self.io1.is_high() { 0x1 } else { 0x0 };
+        }
+
+        let mut value = 0;
+        if self.io0.is_high() {
+            value |= 0x1;
+        }
+        if width >= 2 && self.io1.is_high() {
+            value |= 0x2;
+        }
+        if width >= 4 {
+            if self.io2.is_high() {
+                value |= 0x4;
+            }
+            if self.io3.is_high() {
+                value |= 0x8;
+            }
+        }
+        value
+    }
+
+    #[inline(always)]
+    fn clock_high_sample(&mut self, width: u8) -> u8 {
+        self.delay_half_period();
+        self.sck.set_high();
+        self.delay_half_period();
+        let value = self.read_lane_values(width);
+        self.sck.set_low();
+        value
+    }
+
+    #[inline(always)]
+    fn clock_write(&mut self) {
+        self.delay_half_period();
+        self.sck.set_high();
+        self.delay_half_period();
+        self.sck.set_low();
+    }
+
+    fn write_byte_width(&mut self, value: u8, width: u8) {
+        self.set_lane_dirs(width, true);
+        let mut shift = 8u8 - width;
+        loop {
+            self.set_lane_values((value >> shift) & ((1 << width) - 1), width);
+            self.clock_write();
+            if shift == 0 {
+                break;
+            }
+            shift -= width;
+        }
+    }
+
+    fn read_byte_width(&mut self, width: u8) -> u8 {
+        self.set_lane_dirs(width, false);
+        let mut value = 0u8;
+        let mut bits = 0;
+        while bits < 8 {
+            value <<= width;
+            value |= self.clock_high_sample(width) & ((1 << width) - 1);
+            bits += width;
+        }
+        value
+    }
+
+    fn dummy_clocks(&mut self, width: u8, cycles: u8) {
+        self.set_lane_dirs(width, false);
+        for _ in 0..cycles {
+            self.clock_high_sample(width);
+        }
+    }
+
+    fn write_address(&mut self, address: u32, addr_len: u8, width: u8) {
+        if addr_len == 4 {
+            self.write_byte_width((address >> 24) as u8, width);
+        }
+        self.write_byte_width((address >> 16) as u8, width);
+        self.write_byte_width((address >> 8) as u8, width);
+        self.write_byte_width(address as u8, width);
     }
 
     // =========================================================================
     // Blocking operations (called from USB handler context via critical_section)
     // =========================================================================
 
-    /// Perform a transceive: write command bytes, then read response bytes.
-    /// Used for CMD_TRANSCEIVE — short transfers (max 16 bytes each direction).
-    /// CS is asserted/deasserted within this call.
+    /// Perform a standard 1-1-1 transceive: write command bytes, then read
+    /// response bytes while CS remains asserted.
     pub fn transceive_blocking(&mut self, write_data: &[u8], read_buf: &mut [u8]) {
-        use embedded_hal::spi::SpiBus;
-
         self.cs_assert();
-        // Clock out the command/address bytes
-        SpiBus::write(&mut self.spi, write_data).ok();
-        // Clock in the response bytes (MOSI sends zeros)
-        if !read_buf.is_empty() {
-            SpiBus::read(&mut self.spi, read_buf).ok();
+        for &byte in write_data {
+            self.write_byte_width(byte, 1);
+        }
+        for byte in read_buf.iter_mut() {
+            *byte = self.read_byte_width(1);
         }
         self.cs_deassert();
     }
 
-    /// Write-only transceive (no read phase). CS asserted/deasserted within.
+    /// Write-only standard 1-1-1 transaction.
     pub fn write_only_blocking(&mut self, write_data: &[u8]) {
-        use embedded_hal::spi::SpiBus;
-
         self.cs_assert();
-        SpiBus::write(&mut self.spi, write_data).ok();
+        for &byte in write_data {
+            self.write_byte_width(byte, 1);
+        }
         self.cs_deassert();
     }
 
     // =========================================================================
-    // Async operations (called from bulk worker task with DMA)
+    // Async operations (called from bulk worker task)
     // =========================================================================
 
-    /// Begin a SPI read sequence: assert CS, send opcode + address + dummy bytes.
-    /// After this, call `read_block()` repeatedly, then `end_transfer()`.
+    /// Begin a read sequence. Opcode is always 1-bit unless QPI is requested.
+    /// Address/mode/data phases follow the current Dediprog I/O mode.
     pub async fn start_read(
         &mut self,
         opcode: u8,
         address: u32,
         addr_len: u8,
-        dummy_bytes: u8,
+        io_mode: IoMode,
+        mode_byte: Option<u8>,
+        dummy_cycles: u8,
     ) {
         self.cs_assert();
 
-        // Build command: opcode + address + dummy
-        let mut cmd = [0u8; 10]; // 1 opcode + 4 addr + 5 dummy max
-        let mut len = 0;
+        let opcode_width = if io_mode == IoMode::Qpi { 4 } else { 1 };
+        let address_width = io_mode.address_width();
+        let read_width = io_mode.read_width();
 
-        cmd[len] = opcode;
-        len += 1;
+        self.write_byte_width(opcode, opcode_width);
+        self.write_address(address, addr_len, address_width);
 
-        if addr_len == 4 {
-            cmd[len] = (address >> 24) as u8;
-            len += 1;
-        }
-        cmd[len] = (address >> 16) as u8;
-        len += 1;
-        cmd[len] = (address >> 8) as u8;
-        len += 1;
-        cmd[len] = address as u8;
-        len += 1;
-
-        for _ in 0..dummy_bytes {
-            cmd[len] = 0x00;
-            len += 1;
+        if let Some(mode) = mode_byte {
+            self.write_byte_width(mode, address_width);
         }
 
-        self.spi.write(&cmd[..len]).await.ok();
+        self.dummy_clocks(read_width, dummy_cycles);
     }
 
-    /// Read one block of data (up to buf.len() bytes) from the flash.
-    /// CS must already be asserted via `start_read()`.
-    pub async fn read_block(&mut self, buf: &mut [u8]) {
-        self.spi.read(buf).await.ok();
+    /// Read one block of data. CS must already be asserted via `start_read()`.
+    pub async fn read_block(&mut self, buf: &mut [u8], io_mode: IoMode) {
+        let width = io_mode.read_width();
+        for byte in buf.iter_mut() {
+            *byte = self.read_byte_width(width);
+        }
     }
 
     /// Finish a multi-block transfer (deassert CS).
@@ -158,45 +317,20 @@ impl<'d> SpiFlash<'d> {
         self.cs_deassert();
     }
 
-    /// Write one page to flash:
-    ///   1. Send Write Enable (WREN, 0x06)
-    ///   2. Send Page Program (opcode + address + data)
-    ///   3. Poll status register until WIP clears
-    pub async fn write_page(
-        &mut self,
-        opcode: u8,
-        address: u32,
-        addr_len: u8,
-        data: &[u8],
-    ) {
+    /// Write one page to flash using standard 1-1-1 page program.
+    pub async fn write_page(&mut self, opcode: u8, address: u32, addr_len: u8, data: &[u8]) {
         // ---- Write Enable ----
         self.cs_assert();
-        self.spi.write(&[config::SPI_CMD_WRITE_ENABLE]).await.ok();
+        self.write_byte_width(config::SPI_CMD_WRITE_ENABLE, 1);
         self.cs_deassert();
 
         // ---- Page Program ----
         self.cs_assert();
-
-        let mut cmd = [0u8; 5]; // opcode + up to 4 address bytes
-        let mut len = 0;
-
-        cmd[len] = opcode;
-        len += 1;
-
-        if addr_len == 4 {
-            cmd[len] = (address >> 24) as u8;
-            len += 1;
+        self.write_byte_width(opcode, 1);
+        self.write_address(address, addr_len, 1);
+        for &byte in data {
+            self.write_byte_width(byte, 1);
         }
-        cmd[len] = (address >> 16) as u8;
-        len += 1;
-        cmd[len] = (address >> 8) as u8;
-        len += 1;
-        cmd[len] = address as u8;
-        len += 1;
-
-        self.spi.write(&cmd[..len]).await.ok();
-        self.spi.write(data).await.ok();
-
         self.cs_deassert();
 
         // ---- Wait for completion ----
@@ -207,12 +341,11 @@ impl<'d> SpiFlash<'d> {
     async fn poll_wip(&mut self) {
         loop {
             self.cs_assert();
-            self.spi.write(&[config::SPI_CMD_READ_STATUS]).await.ok();
-            let mut status = [0u8; 1];
-            self.spi.read(&mut status).await.ok();
+            self.write_byte_width(config::SPI_CMD_READ_STATUS, 1);
+            let status = self.read_byte_width(1);
             self.cs_deassert();
 
-            if status[0] & config::SPI_STATUS_WIP == 0 {
+            if status & config::SPI_STATUS_WIP == 0 {
                 break;
             }
 

@@ -12,12 +12,14 @@ as a USB-to-SPI flash programmer.
 
 ### SPI (directly to flash chip)
 
-| Function       | Pico Pin | GPIO |
-|----------------|----------|------|
-| SPI SCK        | 4        | GP2  |
-| SPI MOSI (IO0) | 5        | GP3  |
-| SPI MISO (IO1) | 6        | GP4  |
-| SPI CS#        | 7        | GP5  |
+| Function        | Pico Pin | GPIO |
+|-----------------|----------|------|
+| SPI SCK         | 4        | GP2  |
+| SPI IO0 / MOSI  | 5        | GP3  |
+| SPI IO1 / MISO  | 6        | GP4  |
+| SPI IO2 / WP#   | 7        | GP5  |
+| SPI IO3 / HOLD# | 9        | GP6  |
+| SPI CS#         | 10       | GP7  |
 
 ### LEDs (active-high)
 
@@ -33,9 +35,11 @@ as a USB-to-SPI flash programmer.
             Raspberry Pi Pico
            ┌─────────────────┐
            │               GP2├──── SCK
-           │               GP3├──── MOSI
-           │               GP4├──── MISO
-           │               GP5├──── CS#
+           │               GP3├──── IO0 / MOSI
+           │               GP4├──── IO1 / MISO
+           │               GP5├──── IO2 / WP#
+           │               GP6├──── IO3 / HOLD#
+           │               GP7├──── CS#
            │                  │
            │              GP25├──── Pass LED (onboard)
            │              GP14├──── Busy LED
@@ -51,7 +55,9 @@ as a USB-to-SPI flash programmer.
 ```
 
 The Pico supplies 3.3 V directly. No level shifter is needed for 3.3 V flash
-chips. For 1.8 V parts, add an external level shifter.
+chips. For 1.8 V parts, add an external level shifter. For quad I/O, make sure
+IO2/WP# and IO3/HOLD# are wired. External pull-ups on IO2 and IO3 are still a
+good idea even though the firmware enables/holds them high when idle.
 
 ## Building
 
@@ -91,6 +97,10 @@ flashprog -p dediprog -r dump.bin
 # write (erases first)
 flashprog -p dediprog -w firmware.bin
 
+# quad/dual read path
+flashprog -p dediprog:iomode=quad -r dump.bin
+flashprog -p dediprog:iomode=dual -r dump.bin
+
 # with explicit parameters
 flashprog -p dediprog:spispeed=12M,voltage=3.5V -r dump.bin
 
@@ -101,7 +111,7 @@ flashprog -p dediprog -VVV
 ## What it emulates
 
 The firmware presents itself as a Dediprog **SF600** running firmware
-**v7.2.21**, which selects **Protocol V2** in flashprog. It exposes
+**v7.2.22**, which selects **Protocol V3** in flashprog. It exposes
 USB VID:PID `0483:DADA` with:
 
 - EP0 control — all `CMD_*` vendor requests
@@ -116,11 +126,13 @@ Supported commands: `TRANSCEIVE`, `READ`, `WRITE`, `SET_VCC`, `SET_SPI_CLK`,
 
 - **Full Speed USB only** (12 Mbit/s vs 480 Mbit/s on a real SF600). A 16 MiB
   flash read takes ~11 s instead of ~0.3 s. Functionally identical, just slower.
-- **Single I/O only.** Dual/Quad SPI would require PIO; the RP2040 hardware SPI
-  peripheral only supports standard 1-1-1 mode.
-- **SPI clock speed switching** is fully supported. The bus defaults to 30 MHz
-  and is reconfigured at runtime when flashprog sends `SET_SPI_CLK` (e.g.
-  `spispeed=12M`).
+- **Multi-I/O reads are supported by a GPIO bit-bang engine.** `iomode=dual`
+  and `iomode=quad` exercise Dediprog/flashprog's 1-1-2, 1-2-2, 1-1-4, and
+  1-4-4 read paths. This is functionally useful, but not the final high-speed
+  PIO/DMA implementation.
+- **SPI clock speed switching is approximate.** The bit-bang engine inserts
+  delay NOPs for lower requested speeds, but method-call overhead dominates at
+  high speeds. Treat `spispeed=` as a signal-integrity knob, not an exact clock.
 - **No voltage switching.** The Pico's 3V3 rail is always on. `SET_VCC` is
   acknowledged but does not control power.
 
@@ -128,10 +140,10 @@ Supported commands: `TRANSCEIVE`, `READ`, `WRITE`, `SET_VCC`, `SET_SPI_CLK`,
 
 ```
 src/
-├── main.rs           Entry point, USB + SPI init, bulk worker task
+├── main.rs           Entry point, USB + flash-bus init, bulk worker task
 ├── usb_handler.rs    embassy_usb::Handler — dispatches CMD_* control transfers
-├── protocol.rs       Command codes, enums, V2 packet parsing
-├── spi_flash.rs      SPI flash ops (blocking transceive, async bulk R/W)
+├── protocol.rs       Command codes, enums, V2/V3 packet parsing
+├── spi_flash.rs      Lane-aware GPIO flash ops (single, dual, quad reads)
 ├── leds.rs           GPIO LED driver
 └── config.rs         Device identity, constants
 ```

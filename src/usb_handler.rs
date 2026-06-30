@@ -19,6 +19,9 @@ pub struct DediprogHandler {
     /// LED driver.
     leds: Leds<'static>,
 
+    /// Current Dediprog multi-I/O mode requested via CMD_IO_MODE.
+    current_io_mode: IoMode,
+
     /// Whether the device has been configured by the host.
     configured: bool,
 }
@@ -29,6 +32,7 @@ impl DediprogHandler {
             transceive_read_buf: [0u8; 16],
             transceive_read_len: 0,
             leds,
+            current_io_mode: IoMode::Single,
             configured: false,
         }
     }
@@ -193,10 +197,23 @@ impl DediprogHandler {
     // CMD_IO_MODE (0x15)
     // =========================================================================
 
-    fn cmd_io_mode(&self, req: Request) -> Option<OutResponse> {
-        debug!("IO_MODE: {}", req.value);
-        // We only support single I/O; dual/quad would need PIO.
-        Some(OutResponse::Accepted)
+    fn cmd_io_mode(&mut self, req: Request) -> Option<OutResponse> {
+        match IoMode::from_dediprog_value(req.value) {
+            Some(IoMode::Qpi) => {
+                warn!("IO_MODE: QPI requested; accepting but this path is experimental");
+                self.current_io_mode = IoMode::Qpi;
+                Some(OutResponse::Accepted)
+            }
+            Some(mode) => {
+                info!("IO_MODE: {}", mode);
+                self.current_io_mode = mode;
+                Some(OutResponse::Accepted)
+            }
+            None => {
+                warn!("IO_MODE: invalid value {}", req.value);
+                Some(OutResponse::Rejected)
+            }
+        }
     }
 
     // =========================================================================
@@ -204,7 +221,7 @@ impl DediprogHandler {
     // =========================================================================
 
     fn cmd_read_setup(&self, _req: Request, data: &[u8]) -> Option<OutResponse> {
-        let (block_count, mode_byte, opcode, address) = match parse_rw_cmd_v2(data) {
+        let setup = match parse_read_setup(data) {
             Some(v) => v,
             None => {
                 warn!("READ setup: bad packet (len={})", data.len());
@@ -212,31 +229,32 @@ impl DediprogHandler {
             }
         };
 
-        let read_mode = ReadMode::from_byte(mode_byte);
-        let (addr_len, dummy_bytes) = match read_mode {
-            Some(mode) => {
-                let addr_len = if mode.uses_4byte_addr() { 4 } else { 3 };
-                (addr_len, mode.dummy_bytes())
-            }
-            None => {
-                // Default: 3-byte address, no dummy (standard read)
-                (3u8, 0u8)
-            }
+        let io_mode = IoMode::from_read_opcode(setup.opcode, self.current_io_mode);
+        let mode_byte = if io_mode.needs_mode_byte() {
+            Some(0xff)
+        } else {
+            None
         };
 
-        let actual_opcode = if opcode != 0 { opcode } else { 0x03 }; // default: standard read
-
         info!(
-            "READ setup: addr=0x{:08x} blocks={} opcode=0x{:02x} mode={} addr_len={} dummy={}",
-            address, block_count, actual_opcode, mode_byte, addr_len, dummy_bytes
+            "READ setup: addr=0x{:08x} blocks={} opcode=0x{:02x} mode={} io_mode={} addr_len={} dummy_cycles={}",
+            setup.address,
+            setup.block_count,
+            setup.opcode,
+            setup.mode_byte,
+            io_mode,
+            setup.addr_len,
+            setup.dummy_cycles
         );
 
         let op = BulkOperation::Read {
-            address,
-            block_count,
-            opcode: actual_opcode,
-            addr_len,
-            dummy_bytes,
+            address: setup.address,
+            block_count: setup.block_count,
+            opcode: setup.opcode,
+            addr_len: setup.addr_len,
+            io_mode,
+            mode_byte,
+            dummy_cycles: setup.dummy_cycles,
         };
         critical_section::with(|cs| {
             *BULK_OP.borrow(cs).borrow_mut() = Some(op);

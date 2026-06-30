@@ -14,14 +14,15 @@ use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
-use embassy_rp::gpio::{Level, Output};
-use embassy_rp::peripherals::{SPI0, USB};
-use embassy_rp::spi::{self, Spi};
+use embassy_rp::gpio::{Flex, Level, Output};
+use embassy_rp::peripherals::USB;
 use embassy_rp::usb::{Driver, InterruptHandler};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_sync::zerocopy_channel::Channel;
-use embassy_usb::driver::{Direction, Endpoint as _, EndpointAddress, EndpointIn as _, EndpointOut as _};
+use embassy_usb::driver::{
+    Direction, Endpoint as _, EndpointAddress, EndpointIn as _, EndpointOut as _,
+};
 use embassy_usb::Builder;
 use panic_probe as _;
 use static_cell::StaticCell;
@@ -46,8 +47,7 @@ bind_interrupts!(struct Irqs {
 
 /// SPI flash peripheral — borrowed by the handler for transceive (blocking)
 /// and taken by the worker task for bulk operations (async with DMA).
-pub static SPI_FLASH: Mutex<RefCell<Option<SpiFlash<'static>>>> =
-    Mutex::new(RefCell::new(None));
+pub static SPI_FLASH: Mutex<RefCell<Option<SpiFlash<'static>>>> = Mutex::new(RefCell::new(None));
 
 /// Pending bulk operation set by the handler, consumed by the worker task.
 pub static BULK_OP: Mutex<RefCell<Option<BulkOperation>>> = Mutex::new(RefCell::new(None));
@@ -71,20 +71,24 @@ async fn main(spawner: Spawner) {
 
     info!("DediPico starting up");
 
-    // ---- SPI peripheral ----
-    let mut spi_config = spi::Config::default();
-    spi_config.frequency = DEFAULT_SPI_FREQ_HZ;
-    spi_config.phase = spi::Phase::CaptureOnFirstTransition;
-    spi_config.polarity = spi::Polarity::IdleLow;
-
-    let spi: Spi<'static, SPI0, spi::Async> = Spi::new(
-        p.SPI0, p.PIN_2, p.PIN_3, p.PIN_4, p.DMA_CH0, p.DMA_CH1, spi_config,
-    );
-    let cs = Output::new(p.PIN_5, Level::High); // CS deasserted (high)
+    // ---- Flash bus ----
+    // PIO/multi-I/O-friendly pinout:
+    //   GP2  = SCK
+    //   GP3  = IO0 / MOSI
+    //   GP4  = IO1 / MISO
+    //   GP5  = IO2 / WP#
+    //   GP6  = IO3 / HOLD#
+    //   GP7  = CS#
+    let io0 = Flex::new(p.PIN_3);
+    let io1 = Flex::new(p.PIN_4);
+    let io2 = Flex::new(p.PIN_5);
+    let io3 = Flex::new(p.PIN_6);
+    let sck = Output::new(p.PIN_2, Level::Low);
+    let cs = Output::new(p.PIN_7, Level::High); // CS deasserted (high)
 
     // Store in shared state
     critical_section::with(|cs_tok| {
-        *SPI_FLASH.borrow(cs_tok).borrow_mut() = Some(SpiFlash::new(spi, cs));
+        *SPI_FLASH.borrow(cs_tok).borrow_mut() = Some(SpiFlash::new(io0, io1, io2, io3, sck, cs));
     });
 
     // ---- LEDs ----
@@ -127,7 +131,7 @@ async fn main(spawner: Spawner) {
     //
     // flashprog hard-codes:  EP1 OUT (0x01) for SF600, EP2 IN (0x82) for all.
     // embassy-usb 0.5+ lets us specify exact endpoint addresses.
-    let ep1_out = EndpointAddress::from_parts(5, Direction::Out);
+    let ep1_out = EndpointAddress::from_parts(1, Direction::Out);
     let ep2_in = EndpointAddress::from_parts(2, Direction::In);
 
     let mut func = builder.function(0xFF, 0x00, 0x00);
@@ -194,16 +198,18 @@ async fn bulk_worker_task(
                 block_count,
                 opcode,
                 addr_len,
-                dummy_bytes,
+                dummy_cycles,
+                io_mode,
+                mode_byte,
             } => {
                 info!(
-                    "Bulk READ: addr=0x{:08x} blocks={} opcode=0x{:02x}",
-                    address, block_count, opcode
+                    "Bulk READ: addr=0x{:08x} blocks={} opcode=0x{:02x} io_mode={} dummy_cycles={}",
+                    address, block_count, opcode, io_mode, dummy_cycles
                 );
 
                 ep_in.wait_enabled().await;
                 flash
-                    .start_read(opcode, address, addr_len, dummy_bytes)
+                    .start_read(opcode, address, addr_len, io_mode, mode_byte, dummy_cycles)
                     .await;
 
                 // Zero-copy double buffer: 2 slots of 512 bytes.
@@ -219,7 +225,7 @@ async fn bulk_worker_task(
                     async {
                         for _i in 0..block_count {
                             let slot = sender.send().await;
-                            flash.read_block(slot).await;
+                            flash.read_block(slot, io_mode).await;
                             sender.send_done();
                         }
                     },
@@ -295,9 +301,7 @@ async fn bulk_worker_task(
                                 let slot = receiver.receive().await;
                                 // First 256 bytes are real data; rest is padding.
                                 let page_data = &slot[..PAGE_SIZE];
-                                flash
-                                    .write_page(opcode, address, addr_len, page_data)
-                                    .await;
+                                flash.write_page(opcode, address, addr_len, page_data).await;
                             }
                             receiver.receive_done();
                             address = address.wrapping_add(PAGE_SIZE as u32);

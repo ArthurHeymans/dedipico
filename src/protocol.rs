@@ -73,6 +73,65 @@ impl SpiSpeed {
 }
 
 // =============================================================================
+// SPI I/O lane modes (Dediprog CMD_IO_MODE wValue)
+// =============================================================================
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, defmt::Format)]
+#[repr(u8)]
+pub enum IoMode {
+    Single = 0,  // 1-1-1
+    DualOut = 1, // 1-1-2
+    DualIo = 2,  // 1-2-2
+    QuadOut = 3, // 1-1-4
+    QuadIo = 4,  // 1-4-4
+    Qpi = 5,     // 4-4-4, not advertised by Dediprog iomode=quad
+}
+
+impl IoMode {
+    pub fn from_dediprog_value(value: u16) -> Option<Self> {
+        match value {
+            0 => Some(Self::Single),
+            1 => Some(Self::DualOut),
+            2 => Some(Self::DualIo),
+            3 => Some(Self::QuadOut),
+            4 => Some(Self::QuadIo),
+            5 => Some(Self::Qpi),
+            _ => None,
+        }
+    }
+
+    pub fn read_width(self) -> u8 {
+        match self {
+            Self::Single => 1,
+            Self::DualOut | Self::DualIo => 2,
+            Self::QuadOut | Self::QuadIo | Self::Qpi => 4,
+        }
+    }
+
+    pub fn address_width(self) -> u8 {
+        match self {
+            Self::DualIo => 2,
+            Self::QuadIo | Self::Qpi => 4,
+            Self::Single | Self::DualOut | Self::QuadOut => 1,
+        }
+    }
+
+    pub fn needs_mode_byte(self) -> bool {
+        matches!(self, Self::DualIo | Self::QuadIo | Self::Qpi)
+    }
+
+    pub fn from_read_opcode(opcode: u8, requested: Self) -> Self {
+        match opcode {
+            0x3b | 0x3c => Self::DualOut,
+            0xbb | 0xbc => Self::DualIo,
+            0x6b | 0x6c => Self::QuadOut,
+            0xeb | 0xec => Self::QuadIo,
+            _ => requested,
+        }
+    }
+}
+
+// =============================================================================
 // Read modes (byte 3 of read command packet)
 // =============================================================================
 
@@ -100,7 +159,7 @@ impl ReadMode {
         }
     }
 
-    /// Number of dummy bytes needed after the address for this read mode.
+    /// Number of single-lane dummy bytes needed by legacy read modes.
     pub fn dummy_bytes(self) -> u8 {
         match self {
             ReadMode::Std => 0,
@@ -108,7 +167,7 @@ impl ReadMode {
             | ReadMode::AtmelFast
             | ReadMode::Addr4bFast
             | ReadMode::Addr4bFast0x0C => 1,
-            ReadMode::Configurable => 0, // caller supplies dummy count
+            ReadMode::Configurable => 0,
         }
     }
 
@@ -161,7 +220,9 @@ pub enum BulkOperation {
         block_count: u16,
         opcode: u8,
         addr_len: u8,
-        dummy_bytes: u8,
+        io_mode: IoMode,
+        mode_byte: Option<u8>,
+        dummy_cycles: u8,
     },
     Write {
         address: u32,
@@ -171,11 +232,21 @@ pub enum BulkOperation {
     },
 }
 
+#[derive(Clone, Copy, Debug, defmt::Format)]
+pub struct ReadSetup {
+    pub block_count: u16,
+    pub mode_byte: u8,
+    pub opcode: u8,
+    pub address: u32,
+    pub addr_len: u8,
+    pub dummy_cycles: u8,
+}
+
 // =============================================================================
-// Command packet parsing (Protocol V2)
+// Command packet parsing (Protocol V2/V3)
 // =============================================================================
 
-/// Parse a V2 read/write command packet (10 bytes).
+/// Parse a V2/V3 read/write command packet.
 /// Returns (block_count, mode_byte, opcode, start_address).
 pub fn parse_rw_cmd_v2(data: &[u8]) -> Option<(u16, u8, u8, u32)> {
     if data.len() < 10 {
@@ -189,4 +260,49 @@ pub fn parse_rw_cmd_v2(data: &[u8]) -> Option<(u16, u8, u8, u32)> {
         | ((data[8] as u32) << 16)
         | ((data[9] as u32) << 24);
     Some((block_count, mode, opcode, address))
+}
+
+pub fn parse_read_setup(data: &[u8]) -> Option<ReadSetup> {
+    let (block_count, mode_byte, opcode, address) = parse_rw_cmd_v2(data)?;
+    let read_mode = ReadMode::from_byte(mode_byte);
+
+    let opcode = if opcode != 0 { opcode } else { 0x03 };
+    let (addr_len, dummy_cycles) =
+        if matches!(read_mode, Some(ReadMode::Configurable)) && data.len() >= 12 {
+            // Dediprog protocol V3 stores address length directly. Byte 11 is half
+            // the actual dummy clock count, mirroring flashprog's prepare_rw_cmd_v3().
+            let addr_len = match data[10] {
+                4 => 4,
+                _ => 3,
+            };
+            (addr_len, data[11].saturating_mul(2))
+        } else {
+            let addr_len = match read_mode {
+                Some(mode) if mode.uses_4byte_addr() => 4,
+                _ => match opcode {
+                    0x13 | 0x0c | 0x3c | 0xbc | 0x6c | 0xec => 4,
+                    _ => 3,
+                },
+            };
+
+            let dummy_cycles = match opcode {
+                0x03 | 0x13 => 0,
+                0x0b | 0x0c => 8,
+                0x3b | 0x3c => 8,
+                0xbb | 0xbc => 4,
+                0x6b | 0x6c => 8,
+                0xeb | 0xec => 6,
+                _ => read_mode.map(|m| m.dummy_bytes() * 8).unwrap_or(0),
+            };
+            (addr_len, dummy_cycles)
+        };
+
+    Some(ReadSetup {
+        block_count,
+        mode_byte,
+        opcode,
+        address,
+        addr_len,
+        dummy_cycles,
+    })
 }
