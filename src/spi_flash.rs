@@ -27,7 +27,7 @@ type Pio0Sm0<'d> = StateMachine<'d, PIO0, 0>;
 type Pio0Pin<'d> = Pin<'d, PIO0>;
 type Pio0Program<'d> = LoadedProgram<'d, PIO0>;
 
-const PIO_CYCLES_PER_SCK: u32 = 4;
+const PIO_CYCLES_PER_SCK: u32 = 5;
 const PIO_WAIT_TIMEOUT_ITERS: u32 = 10_000;
 
 struct FlashPioPrograms<'d> {
@@ -131,9 +131,9 @@ impl<'d> SpiFlash<'d> {
     // Runtime PIO clock configuration
     // =========================================================================
 
-    /// Change the generated SCK frequency. The PIO programs follow Embassy's
-    /// PIO-SPI timing: two instructions per bit, each delayed by one extra PIO
-    /// cycle, for four PIO cycles per full SCK period.
+    /// Change the generated SCK frequency. The tuned PIO bit cells use five PIO
+    /// cycles per full SCK period, giving enough phase resolution for reliable
+    /// 24 MHz reads from an SPI flash emulator.
     pub fn set_frequency(&mut self, freq_hz: u32) {
         let target = freq_hz
             .clamp(1, config::MAX_SPI_FREQ_HZ)
@@ -591,10 +591,11 @@ fn assemble_duplex_program(width: u8) -> pio::Program<32> {
     let mut wrap_source = a.label();
 
     a.bind(&mut wrap_target);
-    // Center-sampled mode-0 bit cell. OUT launches data while SCK is low, a one
-    // cycle high-side NOP moves the input sample away from the transition edge,
-    // then IN samples before the next low edge.
+    // Five-cycle mode-0 bit cell tuned for 24 MHz. OUT drives MOSI during the
+    // two-cycle low phase; two high-side NOPs delay MISO sampling until late in
+    // the high phase, which avoids the 24 MHz bit-shift seen with earlier cells.
     a.out_with_delay_and_side_set(pio::OutDestination::PINS, width, 1, 0);
+    a.nop_with_side_set(1);
     a.nop_with_side_set(1);
     a.r#in_with_side_set(pio::InSource::PINS, width, 1);
     a.bind(&mut wrap_source);
@@ -615,7 +616,7 @@ fn assemble_tx_program(width: u8) -> pio::Program<32> {
     a.set_with_side_set(pio::SetDestination::X, groups_per_byte - 1, 0);
     a.bind(&mut bitloop);
     a.out_with_delay_and_side_set(pio::OutDestination::PINS, width, 1, 0);
-    a.jmp_with_delay_and_side_set(pio::JmpCondition::XDecNonZero, &mut bitloop, 1, 1);
+    a.jmp_with_delay_and_side_set(pio::JmpCondition::XDecNonZero, &mut bitloop, 2, 1);
     a.bind(&mut wrap_source);
 
     a.assemble_with_wrap(wrap_source, wrap_target)
@@ -628,10 +629,11 @@ fn assemble_rx_program(width: u8) -> pio::Program<32> {
     let mut wrap_source = a.label();
 
     a.bind(&mut wrap_target);
-    // Read-only version of the center-sampled bit cell. OUT NULL consumes one
-    // lane-group from OSR so autopull provides exactly one byte of clocks per TX
-    // FIFO word; IN samples and autopushes into RX FIFO.
+    // Read-only five-cycle bit cell matching the full-duplex sample phase. OUT
+    // NULL consumes one lane-group from OSR so autopull supplies one byte worth
+    // of clocks per TX FIFO word, while IN samples late in the SCK high phase.
     a.out_with_delay_and_side_set(pio::OutDestination::NULL, width, 1, 0);
+    a.nop_with_side_set(1);
     a.nop_with_side_set(1);
     a.r#in_with_side_set(pio::InSource::PINS, width, 1);
     a.bind(&mut wrap_source);
