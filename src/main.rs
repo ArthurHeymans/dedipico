@@ -127,7 +127,7 @@ async fn main(spawner: Spawner) {
     //
     // flashprog hard-codes:  EP1 OUT (0x01) for SF600, EP2 IN (0x82) for all.
     // embassy-usb 0.5+ lets us specify exact endpoint addresses.
-    let ep1_out = EndpointAddress::from_parts(1, Direction::Out);
+    let ep1_out = EndpointAddress::from_parts(5, Direction::Out);
     let ep2_in = EndpointAddress::from_parts(2, Direction::In);
 
     let mut func = builder.function(0xFF, 0x00, 0x00);
