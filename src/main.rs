@@ -306,6 +306,13 @@ async fn bulk_worker_task(
                             receiver.receive_done();
                             address = address.wrapping_add(PAGE_SIZE as u32);
                         }
+
+                        // EM100 can acknowledge the last page program command before
+                        // its emulated read array is visible to the immediately
+                        // following flashprog verify pass. Give only the final bulk
+                        // write completion a short settle window instead of slowing
+                        // every page program.
+                        embassy_time::Timer::after_millis(25).await;
                     },
                 )
                 .await;

@@ -15,6 +15,7 @@ use embassy_rp::pio::{
     ShiftDirection, StateMachine,
 };
 use embassy_rp::Peri;
+use embassy_time::{Duration, Instant};
 use fixed::traits::ToFixed;
 use fixed::types::extra::U8;
 use fixed::types::U24F8;
@@ -57,6 +58,7 @@ pub struct SpiFlash<'d> {
     active_rx_width: u8,
     rx_bit_correction: bool,
     rx_correction_prev: u8,
+    force_busy_until: Option<Instant>,
 }
 
 impl<'d> SpiFlash<'d> {
@@ -119,6 +121,7 @@ impl<'d> SpiFlash<'d> {
             active_rx_width: 1,
             rx_bit_correction: false,
             rx_correction_prev: 0,
+            force_busy_until: None,
         };
 
         this.cs.set_high();
@@ -391,24 +394,12 @@ impl<'d> SpiFlash<'d> {
         self.write_byte_configured(value);
     }
 
-    fn write_bytes_width(&mut self, data: &[u8], width: u8) {
-        self.configure_tx(width);
-        for &byte in data {
-            self.write_byte_configured(byte);
-        }
-    }
-
     fn read_byte_configured(&mut self) -> u8 {
         if self.push_tx_bounded(0) && self.wait_rx_ready() {
             self.sm.rx().pull() as u8
         } else {
             0xff
         }
-    }
-
-    fn read_byte_width(&mut self, width: u8) -> u8 {
-        self.configure_rx(width);
-        self.read_byte_configured()
     }
 
     fn duplex1_write_read_byte_configured(&mut self, value: u8) -> Option<u8> {
@@ -420,21 +411,57 @@ impl<'d> SpiFlash<'d> {
         }
     }
 
+    fn write_1bit_bytes_duplex(&mut self, data: &[u8]) -> bool {
+        self.configure_duplex1();
+        self.write_1bit_bytes_duplex_configured(data)
+    }
+
+    fn write_1bit_bytes_duplex_configured(&mut self, data: &[u8]) -> bool {
+        for &byte in data {
+            if self.duplex1_write_read_byte_configured(byte).is_none() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn write_address_1bit_duplex_configured(&mut self, address: u32, addr_len: u8) -> bool {
+        if addr_len == 4
+            && self
+                .duplex1_write_read_byte_configured((address >> 24) as u8)
+                .is_none()
+        {
+            return false;
+        }
+
+        self.duplex1_write_read_byte_configured((address >> 16) as u8)
+            .is_some()
+            && self
+                .duplex1_write_read_byte_configured((address >> 8) as u8)
+                .is_some()
+            && self
+                .duplex1_write_read_byte_configured(address as u8)
+                .is_some()
+    }
+
     fn dummy_clocks(&mut self, width: u8, cycles: u8) {
         if cycles == 0 {
             return;
         }
 
+        self.configure_tx(width);
+        self.dummy_clocks_configured(width, cycles);
+    }
+
+    fn dummy_clocks_configured(&mut self, width: u8, cycles: u8) {
         let cycles_per_byte = 8 / width;
         let bytes = cycles.div_ceil(cycles_per_byte);
-        self.configure_tx(width);
         for _ in 0..bytes {
             self.write_byte_configured(0);
         }
     }
 
-    fn write_address(&mut self, address: u32, addr_len: u8, width: u8) {
-        self.configure_tx(width);
+    fn write_address_configured(&mut self, address: u32, addr_len: u8) {
         if addr_len == 4 {
             self.write_byte_configured((address >> 24) as u8);
         }
@@ -450,6 +477,15 @@ impl<'d> SpiFlash<'d> {
     /// Perform a standard 1-1-1 transceive: write command bytes, then read
     /// response bytes while CS remains asserted.
     pub fn transceive_blocking(&mut self, write_data: &[u8], read_buf: &mut [u8]) {
+        if matches!(write_data.first(), Some(&config::SPI_CMD_READ_STATUS))
+            && self
+                .force_busy_until
+                .is_some_and(|until| Instant::now() < until)
+        {
+            read_buf.fill(config::SPI_STATUS_WIP);
+            return;
+        }
+
         self.cs_assert();
         self.configure_duplex1();
         for &byte in write_data {
@@ -484,8 +520,12 @@ impl<'d> SpiFlash<'d> {
     /// Write-only standard 1-1-1 transaction.
     pub fn write_only_blocking(&mut self, write_data: &[u8]) {
         self.cs_assert();
-        self.write_bytes_width(write_data, 1);
+        let _ = self.write_1bit_bytes_duplex(write_data);
         self.cs_deassert();
+
+        if let Some(duration) = erase_busy_duration(write_data) {
+            self.force_busy_until = Some(Instant::now() + duration);
+        }
     }
 
     // =========================================================================
@@ -503,20 +543,56 @@ impl<'d> SpiFlash<'d> {
         mode_byte: Option<u8>,
         dummy_cycles: u8,
     ) {
+        self.wait_for_forced_busy_window().await;
+
         self.cs_assert();
 
         let opcode_width = if io_mode == IoMode::Qpi { 4 } else { 1 };
         let address_width = io_mode.address_width();
         let read_width = io_mode.read_width();
 
-        self.write_byte_width(opcode, opcode_width);
-        self.write_address(address, addr_len, address_width);
-
-        if let Some(mode) = mode_byte {
-            self.write_byte_width(mode, address_width);
+        if opcode_width == 1 {
+            self.configure_duplex1();
+            let _ = self.duplex1_write_read_byte_configured(opcode);
+        } else {
+            self.write_byte_width(opcode, opcode_width);
         }
 
-        self.dummy_clocks(read_width, dummy_cycles);
+        if address_width == 1 {
+            // Keep 1-bit command/address phases on the full-duplex engine. The
+            // TX-only engine can otherwise lose the final bit when immediately
+            // reconfigured for a multi-lane address/read phase; EM100 traces saw
+            // 0xbb degraded to 0xba in that case.
+            self.configure_duplex1();
+            let _ = self.write_address_1bit_duplex_configured(address, addr_len);
+            if let Some(mode) = mode_byte {
+                let _ = self.duplex1_write_read_byte_configured(mode);
+            }
+            if dummy_cycles > 0 && read_width == 1 {
+                let cycles_per_byte = 8 / read_width;
+                let bytes = dummy_cycles.div_ceil(cycles_per_byte);
+                for _ in 0..bytes {
+                    let _ = self.duplex1_write_read_byte_configured(0);
+                }
+            } else {
+                self.dummy_clocks(read_width, dummy_cycles);
+            }
+        } else {
+            // For DIO/QIO, keep address, mode and same-width dummy clocks in one
+            // TX configuration so the final bit of a phase cannot be truncated by
+            // state-machine reconfiguration.
+            self.configure_tx(address_width);
+            self.write_address_configured(address, addr_len);
+            if let Some(mode) = mode_byte {
+                self.write_byte_configured(mode);
+            }
+            if dummy_cycles > 0 && read_width == address_width {
+                self.dummy_clocks_configured(address_width, dummy_cycles);
+            } else {
+                self.dummy_clocks(read_width, dummy_cycles);
+            }
+        }
+
         self.configure_rx(read_width);
         if read_width == 1 && self.needs_1bit_rx_correction() {
             self.rx_correction_prev = self.read_byte_configured();
@@ -551,19 +627,28 @@ impl<'d> SpiFlash<'d> {
 
     /// Write one page to flash using standard 1-1-1 page program.
     pub async fn write_page(&mut self, opcode: u8, address: u32, addr_len: u8, data: &[u8]) {
+        self.wait_for_forced_busy_window().await;
+
         // ---- Write Enable ----
         self.cs_assert();
-        self.write_byte_width(config::SPI_CMD_WRITE_ENABLE, 1);
+        let _ = self.write_1bit_bytes_duplex(&[config::SPI_CMD_WRITE_ENABLE]);
         self.cs_deassert();
+        embassy_time::Timer::after_micros(1).await;
 
         // ---- Page Program ----
         self.cs_assert();
-        self.write_byte_width(opcode, 1);
-        self.write_address(address, addr_len, 1);
-        self.write_bytes_width(data, 1);
+        self.configure_duplex1();
+        let _ = self.duplex1_write_read_byte_configured(opcode);
+        let _ = self.write_address_1bit_duplex_configured(address, addr_len);
+        let _ = self.write_1bit_bytes_duplex_configured(data);
         self.cs_deassert();
 
         // ---- Wait for completion ----
+        // Some emulators do not assert WIP quickly enough for an immediate status
+        // read after CS deassertion. Give the page-program operation a short head
+        // start before polling so the following page's WREN/program sequence is
+        // not ignored while the target is still internally busy.
+        embassy_time::Timer::after_micros(1_000).await;
         self.poll_wip().await;
     }
 
@@ -571,8 +656,9 @@ impl<'d> SpiFlash<'d> {
     async fn poll_wip(&mut self) {
         loop {
             self.cs_assert();
-            self.write_byte_width(config::SPI_CMD_READ_STATUS, 1);
-            let status = self.read_byte_width(1);
+            self.configure_duplex1();
+            let _ = self.duplex1_write_read_byte_configured(config::SPI_CMD_READ_STATUS);
+            let status = self.duplex1_write_read_byte_configured(0).unwrap_or(0xff);
             self.cs_deassert();
 
             if status & config::SPI_STATUS_WIP == 0 {
@@ -580,6 +666,22 @@ impl<'d> SpiFlash<'d> {
             }
 
             embassy_time::Timer::after_micros(50).await;
+        }
+    }
+
+    async fn wait_for_forced_busy_window(&mut self) {
+        loop {
+            match self.force_busy_until {
+                Some(until) if Instant::now() < until => {
+                    embassy_time::Timer::after_millis(1).await;
+                }
+                Some(_) => {
+                    self.force_busy_until = None;
+                    embassy_time::Timer::after_millis(25).await;
+                    break;
+                }
+                None => break,
+            }
         }
     }
 }
@@ -639,4 +741,21 @@ fn assemble_rx_program(width: u8) -> pio::Program<32> {
     a.bind(&mut wrap_source);
 
     a.assemble_with_wrap(wrap_source, wrap_target)
+}
+
+fn erase_busy_duration(write_data: &[u8]) -> Option<Duration> {
+    let opcode = *write_data.first()?;
+    match opcode {
+        // 4 KiB sector erase. EM100 usually finishes much sooner, but this keeps
+        // the host from issuing the next command before WIP is visible.
+        0x20 | 0x21 => Some(Duration::from_millis(250)),
+        // 32 KiB block erase.
+        0x52 | 0x5c => Some(Duration::from_millis(750)),
+        // 64 KiB block erase.
+        0xd8 | 0xdc => Some(Duration::from_millis(1_500)),
+        // Whole-chip erase. EM100 takes long enough that immediately following
+        // page-program commands can be ignored unless we hold WIP high here.
+        0x60 | 0xc7 => Some(Duration::from_secs(60)),
+        _ => None,
+    }
 }
