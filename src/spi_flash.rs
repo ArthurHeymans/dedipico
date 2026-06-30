@@ -75,12 +75,13 @@ impl<'d> SpiFlash<'d> {
         io3.set_pull(Pull::Up);
         sck.set_pull(Pull::None);
 
-        // Input synchronizers add delay at high clock rates. These flash signals
-        // are synchronous to our generated SCK, so bypass them for sampling.
-        io0.set_input_sync_bypass(true);
-        io1.set_input_sync_bypass(true);
-        io2.set_input_sync_bypass(true);
-        io3.set_input_sync_bypass(true);
+        // Keep the input synchronizers enabled. The extra couple of sysclk
+        // cycles move PIO sampling away from SCK edges, which is more robust
+        // with the EM100 than sampling the raw pad value immediately.
+        io0.set_input_sync_bypass(false);
+        io1.set_input_sync_bypass(false);
+        io2.set_input_sync_bypass(false);
+        io3.set_input_sync_bypass(false);
 
         let programs = FlashPioPrograms {
             tx1: pio.common.load_program(&assemble_tx_program(1)),
@@ -117,10 +118,15 @@ impl<'d> SpiFlash<'d> {
     // Runtime PIO clock configuration
     // =========================================================================
 
-    /// Change the generated SCK frequency. PIO programs use two instructions
-    /// per SCK cycle: one with SCK low and one with SCK high.
+    /// Change the generated SCK frequency. Most PIO programs use two
+    /// instructions per SCK cycle: one with SCK low and one with SCK high. The
+    /// 1-bit RX program intentionally uses one extra low-cycle setup
+    /// instruction, so classic readback is a little slower than requested but
+    /// has more MISO setup margin before the sampling edge.
     pub fn set_frequency(&mut self, freq_hz: u32) {
-        let target = freq_hz.clamp(1, clk_sys_freq() / 2);
+        let target = freq_hz
+            .clamp(1, config::MAX_SPI_FREQ_HZ)
+            .min(clk_sys_freq() / 2);
         let clock_freq = U24F8::from_num(clk_sys_freq());
         let pio_bit_freq = U24F8::from_num(target.saturating_mul(2));
         self.clock_divider = clock_freq / pio_bit_freq;
@@ -478,6 +484,13 @@ fn assemble_rx_program(width: u8) -> pio::Program<32> {
     );
     a.set_with_side_set(pio::SetDestination::X, groups_per_byte - 1, 0);
     a.bind(&mut bitloop);
+    if width == 1 {
+        // Give the target an extra low-SCK setup cycle before sampling the next
+        // 1-bit value. Sampling a cycle later while SCK is already high loses
+        // the first bit on the EM100; extending the low phase instead preserves
+        // bit alignment while moving the sample farther from the previous edge.
+        a.nop_with_side_set(0);
+    }
     a.r#in_with_side_set(pio::InSource::PINS, width, 1);
     a.jmp_with_side_set(pio::JmpCondition::XDecNonZero, &mut bitloop, 0);
     a.push_with_side_set(false, true, 0);
