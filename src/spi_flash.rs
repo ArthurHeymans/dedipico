@@ -25,7 +25,10 @@ type Pio0Sm0<'d> = StateMachine<'d, PIO0, 0>;
 type Pio0Pin<'d> = Pin<'d, PIO0>;
 type Pio0Program<'d> = LoadedProgram<'d, PIO0>;
 
+const PIO_CYCLES_PER_SCK: u32 = 4;
+
 struct FlashPioPrograms<'d> {
+    duplex1: Pio0Program<'d>,
     tx1: Pio0Program<'d>,
     tx2: Pio0Program<'d>,
     tx4: Pio0Program<'d>,
@@ -47,7 +50,10 @@ pub struct SpiFlash<'d> {
     sck: Pio0Pin<'d>,
     cs: Output<'d>,
     clock_divider: U24F8,
+    effective_freq_hz: u32,
     active_rx_width: u8,
+    rx_bit_correction: bool,
+    rx_correction_prev: u8,
 }
 
 impl<'d> SpiFlash<'d> {
@@ -84,6 +90,7 @@ impl<'d> SpiFlash<'d> {
         io3.set_input_sync_bypass(false);
 
         let programs = FlashPioPrograms {
+            duplex1: pio.common.load_program(&assemble_duplex_program(1)),
             tx1: pio.common.load_program(&assemble_tx_program(1)),
             tx2: pio.common.load_program(&assemble_tx_program(2)),
             tx4: pio.common.load_program(&assemble_tx_program(4)),
@@ -104,8 +111,11 @@ impl<'d> SpiFlash<'d> {
             io3,
             sck,
             cs,
-            clock_divider: U24F8::from_num(2),
+            clock_divider: U24F8::from_num(PIO_CYCLES_PER_SCK),
+            effective_freq_hz: config::DEFAULT_SPI_FREQ_HZ,
             active_rx_width: 1,
+            rx_bit_correction: false,
+            rx_correction_prev: 0,
         };
 
         this.cs.set_high();
@@ -118,18 +128,27 @@ impl<'d> SpiFlash<'d> {
     // Runtime PIO clock configuration
     // =========================================================================
 
-    /// Change the generated SCK frequency. Most PIO programs use two
-    /// instructions per SCK cycle: one with SCK low and one with SCK high. The
-    /// 1-bit RX program intentionally uses one extra low-cycle setup
-    /// instruction, so classic readback is a little slower than requested but
-    /// has more MISO setup margin before the sampling edge.
+    /// Change the generated SCK frequency. The PIO programs follow Embassy's
+    /// PIO-SPI timing: two instructions per bit, each delayed by one extra PIO
+    /// cycle, for four PIO cycles per full SCK period.
     pub fn set_frequency(&mut self, freq_hz: u32) {
         let target = freq_hz
             .clamp(1, config::MAX_SPI_FREQ_HZ)
-            .min(clk_sys_freq() / 2);
+            .min(clk_sys_freq() / PIO_CYCLES_PER_SCK);
         let clock_freq = U24F8::from_num(clk_sys_freq());
-        let pio_bit_freq = U24F8::from_num(target.saturating_mul(2));
+        let pio_bit_freq = U24F8::from_num(target.saturating_mul(PIO_CYCLES_PER_SCK));
         self.clock_divider = clock_freq / pio_bit_freq;
+        self.effective_freq_hz = target;
+    }
+
+    fn needs_1bit_rx_correction(&self) -> bool {
+        self.effective_freq_hz > 375_000
+    }
+
+    fn correct_next_rx_byte(&mut self, raw: u8) -> u8 {
+        let corrected = (self.rx_correction_prev << 1) | (raw >> 7);
+        self.rx_correction_prev = raw;
+        corrected
     }
 
     // =========================================================================
@@ -219,12 +238,18 @@ impl<'d> SpiFlash<'d> {
     fn configure_rx(&mut self, width: u8) {
         self.sm.set_enable(false);
         self.sm.clear_fifos();
+        self.rx_bit_correction = false;
 
         let mut cfg = Config::default();
         cfg.clock_divider = self.clock_divider;
         cfg.fifo_join = FifoJoin::Duplex;
         cfg.shift_in = ShiftConfig {
-            auto_fill: false,
+            auto_fill: true,
+            threshold: 8,
+            direction: ShiftDirection::Left,
+        };
+        cfg.shift_out = ShiftConfig {
+            auto_fill: true,
             threshold: 8,
             direction: ShiftDirection::Left,
         };
@@ -265,6 +290,46 @@ impl<'d> SpiFlash<'d> {
         }
 
         self.active_rx_width = width;
+        self.sm.restart();
+        self.sm.clkdiv_restart();
+        self.clear_tx_stall();
+        self.sm.set_enable(true);
+        self.wait_tx_stalled();
+    }
+
+    fn configure_duplex1(&mut self) {
+        self.sm.set_enable(false);
+        self.sm.clear_fifos();
+        self.rx_bit_correction = false;
+
+        let mut cfg = Config::default();
+        cfg.clock_divider = self.clock_divider;
+        cfg.fifo_join = FifoJoin::Duplex;
+        cfg.shift_in = ShiftConfig {
+            auto_fill: true,
+            threshold: 8,
+            direction: ShiftDirection::Left,
+        };
+        cfg.shift_out = ShiftConfig {
+            auto_fill: true,
+            threshold: 8,
+            direction: ShiftDirection::Left,
+        };
+
+        cfg.use_program(&self.programs.duplex1, &[&self.sck]);
+        cfg.set_out_pins(&[&self.io0]);
+        cfg.set_in_pins(&[&self.io1]);
+
+        self.sm.set_config(&cfg);
+        self.sm.set_pins(Level::Low, &[&self.sck, &self.io0]);
+        self.sm.set_pins(Level::High, &[&self.io2, &self.io3]);
+        self.sm.set_pin_dirs(
+            Direction::Out,
+            &[&self.sck, &self.io0, &self.io2, &self.io3],
+        );
+        self.sm.set_pin_dirs(Direction::In, &[&self.io1]);
+
+        self.active_rx_width = 1;
         self.sm.restart();
         self.sm.clkdiv_restart();
         self.clear_tx_stall();
@@ -313,6 +378,15 @@ impl<'d> SpiFlash<'d> {
         self.read_byte_configured()
     }
 
+    fn duplex1_write_read_byte_configured(&mut self, value: u8) -> u8 {
+        self.clear_tx_stall();
+        self.sm.tx().push((value as u32) << 24);
+        while self.sm.rx().empty() {
+            cortex_m::asm::nop();
+        }
+        self.sm.rx().pull() as u8
+    }
+
     fn dummy_clocks(&mut self, width: u8, cycles: u8) {
         if cycles == 0 {
             return;
@@ -344,11 +418,19 @@ impl<'d> SpiFlash<'d> {
     /// response bytes while CS remains asserted.
     pub fn transceive_blocking(&mut self, write_data: &[u8], read_buf: &mut [u8]) {
         self.cs_assert();
-        self.write_bytes_width(write_data, 1);
-        if !read_buf.is_empty() {
-            self.configure_rx(1);
+        self.configure_duplex1();
+        for &byte in write_data {
+            let _ = self.duplex1_write_read_byte_configured(byte);
+        }
+        if self.needs_1bit_rx_correction() && !read_buf.is_empty() {
+            self.rx_correction_prev = self.duplex1_write_read_byte_configured(0);
             for byte in read_buf.iter_mut() {
-                *byte = self.read_byte_configured();
+                let raw = self.duplex1_write_read_byte_configured(0);
+                *byte = self.correct_next_rx_byte(raw);
+            }
+        } else {
+            for byte in read_buf.iter_mut() {
+                *byte = self.duplex1_write_read_byte_configured(0);
             }
         }
         self.cs_deassert();
@@ -391,6 +473,10 @@ impl<'d> SpiFlash<'d> {
 
         self.dummy_clocks(read_width, dummy_cycles);
         self.configure_rx(read_width);
+        if read_width == 1 && self.needs_1bit_rx_correction() {
+            self.rx_correction_prev = self.read_byte_configured();
+            self.rx_bit_correction = true;
+        }
     }
 
     /// DMA-read one block of data. CS must already be asserted via `start_read()`.
@@ -405,6 +491,12 @@ impl<'d> SpiFlash<'d> {
         let rx_transfer = rx.dma_pull(self.dma_rx.reborrow(), buf, false);
         let tx_transfer = tx.dma_push_repeated::<_, u32>(self.dma_tx.reborrow(), len);
         join(rx_transfer, tx_transfer).await;
+
+        if self.rx_bit_correction {
+            for byte in buf.iter_mut() {
+                *byte = self.correct_next_rx_byte(*byte);
+            }
+        }
     }
 
     /// Finish a multi-block transfer (deassert CS).
@@ -447,6 +539,22 @@ impl<'d> SpiFlash<'d> {
     }
 }
 
+fn assemble_duplex_program(width: u8) -> pio::Program<32> {
+    let side_set = pio::SideSet::new(false, 1, false);
+    let mut a = pio::Assembler::<32>::new_with_side_set(side_set);
+    let mut wrap_target = a.label();
+    let mut wrap_source = a.label();
+
+    a.bind(&mut wrap_target);
+    // Embassy's mode-0 PIO SPI loop. OUT stalls with SCK low until one byte is
+    // supplied, then IN samples on the leading edge and autopushes after 8 bits.
+    a.out_with_delay_and_side_set(pio::OutDestination::PINS, width, 1, 0);
+    a.r#in_with_delay_and_side_set(pio::InSource::PINS, width, 1, 1);
+    a.bind(&mut wrap_source);
+
+    a.assemble_with_wrap(wrap_source, wrap_target)
+}
+
 fn assemble_tx_program(width: u8) -> pio::Program<32> {
     let groups_per_byte = 8 / width;
     let side_set = pio::SideSet::new(false, 1, false);
@@ -459,41 +567,25 @@ fn assemble_tx_program(width: u8) -> pio::Program<32> {
     a.pull_with_side_set(false, true, 0);
     a.set_with_side_set(pio::SetDestination::X, groups_per_byte - 1, 0);
     a.bind(&mut bitloop);
-    a.out_with_side_set(pio::OutDestination::PINS, width, 0);
-    a.jmp_with_side_set(pio::JmpCondition::XDecNonZero, &mut bitloop, 1);
+    a.out_with_delay_and_side_set(pio::OutDestination::PINS, width, 1, 0);
+    a.jmp_with_delay_and_side_set(pio::JmpCondition::XDecNonZero, &mut bitloop, 1, 1);
     a.bind(&mut wrap_source);
 
     a.assemble_with_wrap(wrap_source, wrap_target)
 }
 
 fn assemble_rx_program(width: u8) -> pio::Program<32> {
-    let groups_per_byte = 8 / width;
     let side_set = pio::SideSet::new(false, 1, false);
     let mut a = pio::Assembler::<32>::new_with_side_set(side_set);
     let mut wrap_target = a.label();
     let mut wrap_source = a.label();
-    let mut bitloop = a.label();
 
     a.bind(&mut wrap_target);
-    a.pull_with_side_set(false, true, 0);
-    a.mov_with_side_set(
-        pio::MovDestination::ISR,
-        pio::MovOperation::None,
-        pio::MovSource::NULL,
-        0,
-    );
-    a.set_with_side_set(pio::SetDestination::X, groups_per_byte - 1, 0);
-    a.bind(&mut bitloop);
-    if width == 1 {
-        // Give the target an extra low-SCK setup cycle before sampling the next
-        // 1-bit value. Sampling a cycle later while SCK is already high loses
-        // the first bit on the EM100; extending the low phase instead preserves
-        // bit alignment while moving the sample farther from the previous edge.
-        a.nop_with_side_set(0);
-    }
-    a.r#in_with_side_set(pio::InSource::PINS, width, 1);
-    a.jmp_with_side_set(pio::JmpCondition::XDecNonZero, &mut bitloop, 0);
-    a.push_with_side_set(false, true, 0);
+    // Embassy's mode-0 PIO SPI loop adapted for read-only phases. OUT NULL
+    // consumes one lane-group from OSR so autopull provides exactly one byte of
+    // clocks per TX FIFO word; IN autopushes one byte into RX FIFO.
+    a.out_with_delay_and_side_set(pio::OutDestination::NULL, width, 1, 0);
+    a.r#in_with_delay_and_side_set(pio::InSource::PINS, width, 1, 1);
     a.bind(&mut wrap_source);
 
     a.assemble_with_wrap(wrap_source, wrap_target)

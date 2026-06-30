@@ -49,9 +49,7 @@ pub const PAGE_SIZE: usize = 256;
 pub const USB_MAX_PACKET_SIZE: u16 = 64;
 
 /// Default SPI frequency at power-on (Hz).
-pub const DEFAULT_SPI_FREQ_HZ: u32 = 375_000;
+pub const DEFAULT_SPI_FREQ_HZ: u32 = 1_500_000;
 
-/// Temporary conservative ceiling for the all-PIO flash engine. EM100 tracing
-/// shows commands are transmitted correctly at higher requested clocks, but
-/// 1-bit readback currently loses sampling margin above 375 kHz.
-pub const MAX_SPI_FREQ_HZ: u32 = 375_000;
+/// Maximum accepted SPI frequency for the all-PIO flash engine.
+pub const MAX_SPI_FREQ_HZ: u32 = 1_500_000;
