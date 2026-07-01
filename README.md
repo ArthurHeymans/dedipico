@@ -73,16 +73,25 @@ cargo build --release
 
 ## Flashing
 
+### Install a prebuilt UF2
+
+1. Open the latest release on GitHub.
+2. Download `dedipico.uf2` from the release assets.
+3. Hold **BOOTSEL** while plugging in the Pico.
+4. Copy `dedipico.uf2` to the mounted `RPI-RP2` drive.
+
+### Build and flash locally
+
 With a debug probe (another Pico running debugprobe, a CMSIS-DAP adapter, etc.):
 
 ```
 cargo run --release
 ```
 
-Or copy the UF2 to the Pico's mass-storage bootloader:
+Or build the UF2 yourself and copy it to the Pico's mass-storage bootloader:
 
 ```
-cargo install elf2uf2-rs
+cargo install elf2uf2-rs --no-default-features
 elf2uf2-rs target/thumbv6m-none-eabi/release/dedipico dedipico.uf2
 # hold BOOTSEL, plug in Pico, copy dedipico.uf2 to the RPI-RP2 drive
 ```
