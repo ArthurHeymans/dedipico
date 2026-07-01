@@ -1,4 +1,3 @@
-use std::env;
 use std::ffi::CStr;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -7,9 +6,11 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::ptr;
 use std::time::Duration;
 
+use clap::{Parser, Subcommand, ValueEnum};
+
+use nusb::MaybeFuture;
 use nusb::io::{EndpointRead, EndpointWrite};
 use nusb::transfer::{Bulk, In, Out};
-use nusb::MaybeFuture;
 
 const VID: u16 = 0x0483;
 const PID: u16 = 0xDADA;
@@ -144,18 +145,6 @@ impl DediPico {
     }
 }
 
-fn pin(name: &str) -> Result<u8, String> {
-    match name {
-        "reset" => Ok(RESET),
-        "power" => Ok(POWER),
-        "power-state" => Ok(POWER_STATE),
-        "aux" => Ok(AUX),
-        _ => Err(format!(
-            "unknown pin {name}; use reset, power, power-state, aux"
-        )),
-    }
-}
-
 fn print_state(frame: &[u8; FRAME_LEN]) {
     let inputs = frame[1];
     let directions = frame[3];
@@ -255,67 +244,110 @@ fn run_tty(mut dev: DediPico, baud: u32) -> io::Result<()> {
     }
 }
 
-fn usage() -> ! {
-    eprintln!("usage:");
-    eprintln!("  dedipicoctl state");
-    eprintln!("  dedipicoctl dir <reset|power|power-state|aux> <in|out>");
-    eprintln!("  dedipicoctl set <reset|power> <0|1>");
-    eprintln!("  dedipicoctl release <reset|power>");
-    eprintln!("  dedipicoctl pulse <reset|power> <ms>");
-    eprintln!("  dedipicoctl reset [ms=100]");
-    eprintln!("  dedipicoctl power [ms=500]");
-    eprintln!("  dedipicoctl poweroff [ms=5000]");
-    eprintln!("  dedipicoctl tty [baud=115200]");
-    std::process::exit(2);
+#[derive(Parser)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
 }
 
-fn parse_u16(s: Option<&String>, default: u16) -> u16 {
-    s.map(|v| v.parse().unwrap_or_else(|_| usage()))
-        .unwrap_or(default)
+#[derive(Subcommand)]
+enum Command {
+    State,
+    Dir {
+        pin: Pin,
+        direction: Direction,
+    },
+    Set {
+        pin: Pin,
+        value: Level,
+    },
+    Release {
+        pin: Pin,
+    },
+    Pulse {
+        pin: Pin,
+        ms: u16,
+    },
+    Reset {
+        #[arg(default_value_t = 100)]
+        ms: u16,
+    },
+    Power {
+        #[arg(default_value_t = 500)]
+        ms: u16,
+    },
+    Poweroff {
+        #[arg(default_value_t = 5000)]
+        ms: u16,
+    },
+    Tty {
+        #[arg(default_value_t = 115_200)]
+        baud: u32,
+    },
 }
 
-fn parse_u32(s: Option<&String>, default: u32) -> u32 {
-    s.map(|v| v.parse().unwrap_or_else(|_| usage()))
-        .unwrap_or(default)
+#[derive(Clone, Copy, ValueEnum)]
+enum Pin {
+    Reset,
+    Power,
+    PowerState,
+    Aux,
+}
+
+impl Pin {
+    fn bit(self) -> u8 {
+        match self {
+            Self::Reset => RESET,
+            Self::Power => POWER,
+            Self::PowerState => POWER_STATE,
+            Self::Aux => AUX,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Direction {
+    In,
+    Out,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Level {
+    #[value(name = "0")]
+    Low,
+    #[value(name = "1")]
+    High,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
-    let Some(cmd) = args.get(1).map(String::as_str) else {
-        usage();
-    };
+    let cli = Cli::parse();
 
     let mut dev = DediPico::open()?;
-    match cmd {
-        "state" => print_state(&dev.gpio_state()?),
-        "dir" if args.len() == 4 => {
-            let bit = pin(&args[2])?;
-            let dirs = match args[3].as_str() {
-                "in" => 0,
-                "out" => bit,
-                _ => usage(),
+    match cli.command {
+        Command::State => print_state(&dev.gpio_state()?),
+        Command::Dir { pin, direction } => {
+            let bit = pin.bit();
+            let dirs = match direction {
+                Direction::In => 0,
+                Direction::Out => bit,
             };
             print_state(&dev.set_direction(bit, dirs)?);
         }
-        "set" if args.len() == 4 => {
-            let bit = pin(&args[2])?;
-            let value = match args[3].as_str() {
-                "0" => 0,
-                "1" => bit,
-                _ => usage(),
+        Command::Set { pin, value } => {
+            let bit = pin.bit();
+            let value = match value {
+                Level::Low => 0,
+                Level::High => bit,
             };
             dev.set_direction(bit, bit)?;
             print_state(&dev.set_output(bit, value)?);
         }
-        "release" if args.len() == 3 => print_state(&dev.set_direction(pin(&args[2])?, 0)?),
-        "pulse" if args.len() == 4 => {
-            print_state(&dev.pulse_low(pin(&args[2])?, parse_u16(args.get(3), 0))?)
-        }
-        "reset" => print_state(&dev.pulse_low(RESET, parse_u16(args.get(2), 100))?),
-        "power" => print_state(&dev.pulse_low(POWER, parse_u16(args.get(2), 500))?),
-        "poweroff" => print_state(&dev.pulse_low(POWER, parse_u16(args.get(2), 5000))?),
-        "tty" => run_tty(dev, parse_u32(args.get(2), 115_200))?,
-        _ => usage(),
+        Command::Release { pin } => print_state(&dev.set_direction(pin.bit(), 0)?),
+        Command::Pulse { pin, ms } => print_state(&dev.pulse_low(pin.bit(), ms)?),
+        Command::Reset { ms } => print_state(&dev.pulse_low(RESET, ms)?),
+        Command::Power { ms } => print_state(&dev.pulse_low(POWER, ms)?),
+        Command::Poweroff { ms } => print_state(&dev.pulse_low(POWER, ms)?),
+        Command::Tty { baud } => run_tty(dev, baud)?,
     }
     Ok(())
 }

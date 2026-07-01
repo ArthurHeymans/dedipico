@@ -3,8 +3,8 @@
 /// This implements `embassy_usb::Handler` and is called synchronously from the
 /// USB device task whenever a vendor control transfer arrives on EP0.
 use defmt::*;
-use embassy_usb::control::{InResponse, OutResponse, Request, RequestType};
 use embassy_usb::Handler;
+use embassy_usb::control::{InResponse, OutResponse, Request, RequestType};
 
 use crate::config;
 use crate::leds::Leds;
