@@ -15,7 +15,7 @@ use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
-use embassy_rp::gpio::{Level, Output};
+use embassy_rp::gpio::{Flex, Level, Output};
 use embassy_rp::pac;
 use embassy_rp::peripherals::{PIO0, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
@@ -82,7 +82,7 @@ async fn main(spawner: Spawner) {
     //   GP6  = IO3 / HOLD#
     //   GP7  = CS#
     let pio = Pio::new(p.PIO0, Irqs);
-    let cs = Output::new(p.PIN_7, Level::High); // CS deasserted (high)
+    let cs = Flex::new(p.PIN_7); // released/Hi-Z when idle
 
     // Store in shared state
     critical_section::with(|cs_tok| {
