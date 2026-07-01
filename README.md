@@ -75,8 +75,8 @@ cargo build --release
 
 ### Install a prebuilt UF2
 
-1. Open the latest successful GitHub Actions run.
-2. Download the `dedipico-uf2` artifact and unzip it.
+1. Open the latest release on GitHub.
+2. Download `dedipico.uf2` from the release assets.
 3. Hold **BOOTSEL** while plugging in the Pico.
 4. Copy `dedipico.uf2` to the mounted `RPI-RP2` drive.
 
