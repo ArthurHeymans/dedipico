@@ -170,12 +170,10 @@ impl<'d> SpiFlash<'d> {
         self.sm.set_enable(false);
         self.sm.clear_fifos();
         self.sm.set_pins(Level::Low, &[&self.sck, &self.io0]);
-        self.sm.set_pins(Level::High, &[&self.io2, &self.io3]);
-        self.sm.set_pin_dirs(
-            Direction::Out,
-            &[&self.sck, &self.io0, &self.io2, &self.io3],
-        );
+        self.sm
+            .set_pin_dirs(Direction::Out, &[&self.sck, &self.io0]);
         self.sm.set_pin_dirs(Direction::In, &[&self.io1]);
+        self.wp_hold_high();
         self.cs.set_low();
         self.cs.set_as_output();
     }
@@ -190,10 +188,9 @@ impl<'d> SpiFlash<'d> {
     fn idle_io(&mut self) {
         self.sm.set_enable(false);
         self.sm.clear_fifos();
-        self.sm.set_pin_dirs(
-            Direction::In,
-            &[&self.sck, &self.io0, &self.io1, &self.io2, &self.io3],
-        );
+        self.sm
+            .set_pin_dirs(Direction::In, &[&self.sck, &self.io0, &self.io1]);
+        self.wp_hold_high();
         self.io0.set_pull(Pull::None);
         self.io1.set_pull(Pull::None);
         self.io2.set_pull(Pull::None);
@@ -201,6 +198,12 @@ impl<'d> SpiFlash<'d> {
         self.sck.set_pull(Pull::None);
         self.cs.set_pull(Pull::None);
         self.cs.set_as_input();
+    }
+
+    fn wp_hold_high(&mut self) {
+        self.sm.set_pins(Level::High, &[&self.io2, &self.io3]);
+        self.sm
+            .set_pin_dirs(Direction::Out, &[&self.io2, &self.io3]);
     }
 
     fn configure_tx(&mut self, width: u8) {
@@ -234,17 +237,14 @@ impl<'d> SpiFlash<'d> {
 
         match width {
             1 => {
-                self.sm
-                    .set_pin_dirs(Direction::Out, &[&self.io0, &self.io2, &self.io3]);
+                self.sm.set_pin_dirs(Direction::Out, &[&self.io0]);
                 self.sm.set_pin_dirs(Direction::In, &[&self.io1]);
-                self.sm.set_pins(Level::High, &[&self.io2, &self.io3]);
+                self.wp_hold_high();
             }
             2 => {
-                self.sm.set_pin_dirs(
-                    Direction::Out,
-                    &[&self.io0, &self.io1, &self.io2, &self.io3],
-                );
-                self.sm.set_pins(Level::High, &[&self.io2, &self.io3]);
+                self.sm
+                    .set_pin_dirs(Direction::Out, &[&self.io0, &self.io1]);
+                self.wp_hold_high();
             }
             _ => self.sm.set_pin_dirs(
                 Direction::Out,
@@ -297,16 +297,13 @@ impl<'d> SpiFlash<'d> {
         match width {
             1 => {
                 self.sm.set_pins(Level::Low, &[&self.io0]);
-                self.sm.set_pins(Level::High, &[&self.io2, &self.io3]);
-                self.sm
-                    .set_pin_dirs(Direction::Out, &[&self.io0, &self.io2, &self.io3]);
+                self.sm.set_pin_dirs(Direction::Out, &[&self.io0]);
                 self.sm.set_pin_dirs(Direction::In, &[&self.io1]);
+                self.wp_hold_high();
             }
             2 => {
-                self.sm.set_pins(Level::High, &[&self.io2, &self.io3]);
                 self.sm.set_pin_dirs(Direction::In, &[&self.io0, &self.io1]);
-                self.sm
-                    .set_pin_dirs(Direction::Out, &[&self.io2, &self.io3]);
+                self.wp_hold_high();
             }
             _ => self
                 .sm
@@ -345,12 +342,10 @@ impl<'d> SpiFlash<'d> {
 
         self.sm.set_config(&cfg);
         self.sm.set_pins(Level::Low, &[&self.sck, &self.io0]);
-        self.sm.set_pins(Level::High, &[&self.io2, &self.io3]);
-        self.sm.set_pin_dirs(
-            Direction::Out,
-            &[&self.sck, &self.io0, &self.io2, &self.io3],
-        );
+        self.sm
+            .set_pin_dirs(Direction::Out, &[&self.sck, &self.io0]);
         self.sm.set_pin_dirs(Direction::In, &[&self.io1]);
+        self.wp_hold_high();
 
         self.active_rx_width = 1;
         self.sm.restart();
