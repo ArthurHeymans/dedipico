@@ -9,13 +9,13 @@ mod spi_flash;
 mod usb_handler;
 
 use core::cell::RefCell;
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{Ordering, compiler_fence};
 
 use critical_section::Mutex;
 use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{Either, select};
 use embassy_rp::bind_interrupts;
 use embassy_rp::dma::{Channel as DmaChannel, InterruptHandler as DmaInterruptHandler};
 use embassy_rp::gpio::{Flex, Input, Level, Output, OutputOpenDrain, Pull};
@@ -29,10 +29,10 @@ use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_sync::zerocopy_channel::Channel;
+use embassy_usb::Builder;
 use embassy_usb::driver::{
     Direction, Endpoint as _, EndpointAddress, EndpointIn as _, EndpointOut as _,
 };
-use embassy_usb::Builder;
 use panic_probe as _;
 use static_cell::StaticCell;
 
@@ -290,18 +290,9 @@ async fn handle_aux_frame(
         }
         Some(CMD_UART_WRITE) if frame.len() >= 2 => {
             let len = (frame[1] as usize).min(frame.len().saturating_sub(2));
-            write_all_uart(uart_tx, &frame[2..2 + len]).await;
+            let _ = embedded_io_async::Write::write_all(uart_tx, &frame[2..2 + len]).await;
         }
         _ => {}
-    }
-}
-
-async fn write_all_uart(uart_tx: &mut BufferedUartTx, mut data: &[u8]) {
-    while !data.is_empty() {
-        match embedded_io_async::Write::write(uart_tx, data).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => data = &data[n..],
-        }
     }
 }
 
@@ -398,11 +389,11 @@ async fn bulk_worker_task(
                         for i in 0..block_count {
                             {
                                 let slot = receiver.receive().await;
-                                if result.is_ok() {
-                                    if let Err(e) = write_bulk_block(&mut fast_in, slot).await {
-                                        error!("Bulk IN write error at block {}", i);
-                                        result = Err(e);
-                                    }
+                                if result.is_ok()
+                                    && let Err(e) = write_bulk_block(&mut fast_in, slot).await
+                                {
+                                    error!("Bulk IN write error at block {}", i);
+                                    result = Err(e);
                                 }
                             }
                             receiver.receive_done();
@@ -446,11 +437,11 @@ async fn bulk_worker_task(
                         for i in 0..block_count {
                             {
                                 let slot = sender.send().await;
-                                if result.is_ok() {
-                                    if let Err(e) = read_bulk_block(&mut ep_out, slot).await {
-                                        error!("Bulk OUT read error at block {}", i);
-                                        result = Err(e);
-                                    }
+                                if result.is_ok()
+                                    && let Err(e) = read_bulk_block(&mut ep_out, slot).await
+                                {
+                                    error!("Bulk OUT read error at block {}", i);
+                                    result = Err(e);
                                 }
                             }
                             sender.send_done();

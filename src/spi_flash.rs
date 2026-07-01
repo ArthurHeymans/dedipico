@@ -6,6 +6,7 @@
 /// PIO RX FIFO and one feeds one token per byte into the TX FIFO so the state
 /// machine clocks exactly the requested number of bytes and then stalls.
 use embassy_futures::join::join;
+use embassy_rp::Peri;
 use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::dma::Channel as DmaChannel;
 use embassy_rp::gpio::{Flex, Level, Pull};
@@ -14,11 +15,10 @@ use embassy_rp::pio::{
     Common, Config, Direction, FifoJoin, LoadedProgram, Pin, Pio, PioPin, ShiftConfig,
     ShiftDirection, StateMachine,
 };
-use embassy_rp::Peri;
 use embassy_time::{Duration, Instant};
 use fixed::traits::ToFixed;
-use fixed::types::extra::U8;
 use fixed::types::U24F8;
+use fixed::types::extra::U8;
 
 use crate::config;
 use crate::protocol::IoMode;
