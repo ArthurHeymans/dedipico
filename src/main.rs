@@ -20,12 +20,11 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::dma::{Channel as DmaChannel, InterruptHandler as DmaInterruptHandler};
 use embassy_rp::gpio::{Flex, Input, Level, Output, OutputOpenDrain, Pull};
 use embassy_rp::pac;
-use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0, UART0, USB};
+use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIN_0, PIN_1, PIO0, PIO1, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
-use embassy_rp::uart::{
-    BufferedInterruptHandler as UartInterruptHandler, BufferedUart, BufferedUartRx, BufferedUartTx,
-};
+use embassy_rp::pio_programs::uart::{PioUartRx, PioUartRxProgram, PioUartTx, PioUartTxProgram};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
+use embassy_rp::Peri;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_sync::zerocopy_channel::Channel;
@@ -50,7 +49,7 @@ use crate::usb_handler::DediprogHandler;
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
-    UART0_IRQ => UartInterruptHandler<UART0>;
+    PIO1_IRQ_0 => PioInterruptHandler<PIO1>;
     DMA_IRQ_0 => DmaInterruptHandler<DMA_CH0>, DmaInterruptHandler<DMA_CH1>;
 });
 
@@ -67,6 +66,11 @@ pub static BULK_OP: Mutex<RefCell<Option<BulkOperation>>> = Mutex::new(RefCell::
 
 /// Signal to wake the worker task when a bulk operation is ready.
 pub static BULK_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+const FLASH_WP_PIN: usize = 5;
+const FLASH_HOLD_PIN: usize = 6;
+const FLASH_CS_PIN: usize = 7;
+const FLASH_IDLE_HIGH_MASK: u32 = (1 << FLASH_WP_PIN) | (1 << FLASH_HOLD_PIN) | (1 << FLASH_CS_PIN);
 
 // =============================================================================
 // USB device type alias
@@ -92,8 +96,11 @@ async fn main(spawner: Spawner) {
     //   GP5  = IO2 / WP#
     //   GP6  = IO3 / HOLD#
     //   GP7  = CS#
+    force_flash_bus_deselected_at_startup();
     let pio = Pio::new(p.PIO0, Irqs);
-    let cs = Flex::new(p.PIN_7); // released/Hi-Z when idle
+    let mut cs = Flex::new(p.PIN_7); // released/Hi-Z when idle
+    cs.set_high();
+    cs.set_as_output();
 
     // Store in shared state
     critical_section::with(|cs_tok| {
@@ -163,21 +170,11 @@ async fn main(spawner: Spawner) {
     drop(func); // release borrow on builder
 
     // ---- Auxiliary vendor interface ----
-    // GP0 = UART0 TX, GP1 = UART0 RX.
-    let mut uart_config = embassy_rp::uart::Config::default();
-    uart_config.baudrate = 115_200;
-    static UART_TX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
-    static UART_RX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
-    let uart = BufferedUart::new(
-        p.UART0,
-        p.PIN_0,
-        p.PIN_1,
-        Irqs,
-        UART_TX_BUF.init([0; 256]),
-        UART_RX_BUF.init([0; 256]),
-        uart_config,
-    );
-    let (uart_tx, uart_rx) = uart.split();
+    // GP0 = UART TX, GP1 = UART RX. Use PIO1, matching picoprog's PIO UART
+    // approach and keeping the flash bus' PIO0 state machines isolated.
+    let uart_pio = p.PIO1;
+    let uart_tx_pin = p.PIN_0;
+    let uart_rx_pin = p.PIN_1;
 
     // GP8 = RESET# open-drain, GP9 = POWER_SW# open-drain,
     // GP10 = board power-state input, GP11 = auxiliary state input.
@@ -202,7 +199,7 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(usb_device_task(usb).unwrap());
     spawner.spawn(bulk_worker_task(ep_in, ep_out).unwrap());
-    spawner.spawn(aux_task(aux_out, aux_in, uart_tx, uart_rx, board_gpio).unwrap());
+    spawner.spawn(aux_task(aux_out, aux_in, uart_pio, uart_tx_pin, uart_rx_pin, board_gpio).unwrap());
 
     info!("DediPico ready — VID:PID = {:04x}:{:04x}", USB_VID, USB_PID);
 
@@ -210,6 +207,36 @@ async fn main(spawner: Spawner) {
     loop {
         embassy_time::Timer::after_secs(3600).await;
     }
+}
+
+fn force_flash_bus_deselected_at_startup() {
+    // Put CS#, WP# and HOLD# at their inactive levels before PIO takes over the
+    // bus. Some flash parts latch HOLD# relative to CS#, so the safe state must
+    // exist before SpiFlash::new() finishes configuring the PIO pins/programs.
+    pac::SIO
+        .gpio_out(0)
+        .value_set()
+        .write_value(FLASH_IDLE_HIGH_MASK);
+    pac::SIO
+        .gpio_oe(0)
+        .value_set()
+        .write_value(FLASH_IDLE_HIGH_MASK);
+
+    for pin in [FLASH_WP_PIN, FLASH_HOLD_PIN, FLASH_CS_PIN] {
+        pac::PADS_BANK0.gpio(pin).modify(|w| {
+            w.set_ie(true);
+            w.set_od(false);
+            w.set_pue(false);
+            w.set_pde(false);
+        });
+        pac::IO_BANK0.gpio(pin).ctrl().write(|w| {
+            w.set_funcsel(pac::io::vals::Gpio0ctrlFuncsel::SIO_0 as _);
+            w.set_outover(pac::io::vals::Outover::NORMAL);
+            w.set_oeover(pac::io::vals::Oeover::NORMAL);
+        });
+    }
+
+    compiler_fence(Ordering::SeqCst);
 }
 
 // =============================================================================
@@ -229,33 +256,40 @@ async fn usb_device_task(mut usb: embassy_usb::UsbDevice<'static, UsbDriver>) {
 async fn aux_task(
     mut ep_out: <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointOut,
     mut ep_in: <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointIn,
-    mut uart_tx: BufferedUartTx,
-    mut uart_rx: BufferedUartRx,
+    uart_pio: Peri<'static, PIO1>,
+    uart_tx_pin: Peri<'static, PIN_0>,
+    uart_rx_pin: Peri<'static, PIN_1>,
     mut gpio: BoardGpio<'static>,
 ) {
+    let Pio {
+        mut common,
+        sm0,
+        sm1,
+        ..
+    } = Pio::new(uart_pio, Irqs);
+
+    let tx_prog = PioUartTxProgram::new(&mut common);
+    let mut uart_tx = PioUartTx::new(115_200, &mut common, sm0, uart_tx_pin, &tx_prog);
+
+    let rx_prog = PioUartRxProgram::new(&mut common);
+    let mut uart_rx = PioUartRx::new(115_200, &mut common, sm1, uart_rx_pin, &rx_prog);
+
     let mut usb_buf = [0u8; FRAME_LEN];
-    let mut uart_buf = [0u8; FRAME_LEN - 2];
 
     loop {
         ep_out.wait_enabled().await;
         ep_in.wait_enabled().await;
 
-        match select(
-            ep_out.read(&mut usb_buf),
-            embedded_io_async::Read::read(&mut uart_rx, &mut uart_buf),
-        )
-        .await
-        {
+        match select(ep_out.read(&mut usb_buf), uart_rx.read_u8()).await {
             Either::First(Ok(n)) => {
                 handle_aux_frame(&mut ep_in, &mut uart_tx, &mut gpio, &usb_buf[..n]).await;
             }
             Either::First(Err(_)) => {}
-            Either::Second(Ok(0) | Err(_)) => {}
-            Either::Second(Ok(n)) => {
+            Either::Second(byte) => {
                 let mut frame = [0u8; FRAME_LEN];
                 frame[0] = EVT_UART_DATA;
-                frame[1] = n as u8;
-                frame[2..2 + n].copy_from_slice(&uart_buf[..n]);
+                frame[1] = 1;
+                frame[2] = byte;
                 let _ = ep_in.write(&frame).await;
             }
         }
@@ -264,7 +298,7 @@ async fn aux_task(
 
 async fn handle_aux_frame(
     ep_in: &mut <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointIn,
-    uart_tx: &mut BufferedUartTx,
+    uart_tx: &mut PioUartTx<'static, PIO1, 0>,
     gpio: &mut BoardGpio<'static>,
     frame: &[u8],
 ) {
@@ -286,7 +320,8 @@ async fn handle_aux_frame(
             let _ = ep_in.write(&gpio.state_frame()).await;
         }
         Some(CMD_UART_SET_BAUD) if frame.len() >= 5 => {
-            set_uart0_baudrate(u32::from_le_bytes([frame[1], frame[2], frame[3], frame[4]]));
+            // The PIO UART starts at 115200 baud. Runtime retiming can be added
+            // later if the aux protocol needs non-default rates.
         }
         Some(CMD_UART_WRITE) if frame.len() >= 2 => {
             let len = (frame[1] as usize).min(frame.len().saturating_sub(2));
@@ -294,29 +329,6 @@ async fn handle_aux_frame(
         }
         _ => {}
     }
-}
-
-fn set_uart0_baudrate(baudrate: u32) {
-    let baudrate = baudrate.clamp(300, 3_000_000);
-    let clk_base = embassy_rp::clocks::clk_peri_freq();
-    let baud_rate_div = (8 * clk_base) / baudrate;
-    let mut baud_ibrd = baud_rate_div >> 7;
-    let mut baud_fbrd = (baud_rate_div & 0x7f).div_ceil(2);
-
-    if baud_ibrd == 0 {
-        baud_ibrd = 1;
-        baud_fbrd = 0;
-    } else if baud_ibrd >= 65535 {
-        baud_ibrd = 65535;
-        baud_fbrd = 0;
-    }
-
-    let regs = pac::UART0;
-    regs.uartibrd()
-        .write_value(pac::uart::regs::Uartibrd(baud_ibrd));
-    regs.uartfbrd()
-        .write_value(pac::uart::regs::Uartfbrd(baud_fbrd));
-    regs.uartlcr_h().modify(|_| {});
 }
 
 // =============================================================================
