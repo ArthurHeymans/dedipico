@@ -8,7 +8,7 @@
 use embassy_futures::join::join;
 use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::dma::{AnyChannel, Channel};
-use embassy_rp::gpio::{Level, Output, Pull};
+use embassy_rp::gpio::{Flex, Level, Pull};
 use embassy_rp::peripherals::PIO0;
 use embassy_rp::pio::{
     Common, Config, Direction, FifoJoin, LoadedProgram, Pin, Pio, PioPin, ShiftConfig,
@@ -52,7 +52,7 @@ pub struct SpiFlash<'d> {
     io2: Pio0Pin<'d>,
     io3: Pio0Pin<'d>,
     sck: Pio0Pin<'d>,
-    cs: Output<'d>,
+    cs: Flex<'d>,
     clock_divider: U24F8,
     effective_freq_hz: u32,
     active_rx_width: u8,
@@ -72,7 +72,7 @@ impl<'d> SpiFlash<'d> {
         io2: Peri<'d, impl PioPin + 'd>,
         io3: Peri<'d, impl PioPin + 'd>,
         sck: Peri<'d, impl PioPin + 'd>,
-        cs: Output<'d>,
+        cs: Flex<'d>,
     ) -> Self {
         let mut io0 = pio.common.make_pio_pin(io0);
         let mut io1 = pio.common.make_pio_pin(io1);
@@ -124,7 +124,6 @@ impl<'d> SpiFlash<'d> {
             force_busy_until: None,
         };
 
-        this.cs.set_high();
         this.set_frequency(config::DEFAULT_SPI_FREQ_HZ);
         this.idle_io();
         this
@@ -168,7 +167,17 @@ impl<'d> SpiFlash<'d> {
 
     #[inline]
     pub fn cs_assert(&mut self) {
+        self.sm.set_enable(false);
+        self.sm.clear_fifos();
+        self.sm.set_pins(Level::Low, &[&self.sck, &self.io0]);
+        self.sm.set_pins(Level::High, &[&self.io2, &self.io3]);
+        self.sm.set_pin_dirs(
+            Direction::Out,
+            &[&self.sck, &self.io0, &self.io2, &self.io3],
+        );
+        self.sm.set_pin_dirs(Direction::In, &[&self.io1]);
         self.cs.set_low();
+        self.cs.set_as_output();
     }
 
     #[inline]
@@ -181,13 +190,17 @@ impl<'d> SpiFlash<'d> {
     fn idle_io(&mut self) {
         self.sm.set_enable(false);
         self.sm.clear_fifos();
-        self.sm.set_pins(Level::Low, &[&self.sck, &self.io0]);
-        self.sm.set_pins(Level::High, &[&self.io2, &self.io3]);
         self.sm.set_pin_dirs(
-            Direction::Out,
-            &[&self.sck, &self.io0, &self.io2, &self.io3],
+            Direction::In,
+            &[&self.sck, &self.io0, &self.io1, &self.io2, &self.io3],
         );
-        self.sm.set_pin_dirs(Direction::In, &[&self.io1]);
+        self.io0.set_pull(Pull::None);
+        self.io1.set_pull(Pull::None);
+        self.io2.set_pull(Pull::None);
+        self.io3.set_pull(Pull::None);
+        self.sck.set_pull(Pull::None);
+        self.cs.set_pull(Pull::None);
+        self.cs.set_as_input();
     }
 
     fn configure_tx(&mut self, width: u8) {

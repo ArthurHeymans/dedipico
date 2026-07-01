@@ -61,8 +61,9 @@ the PIO programs switch those pins between output and input for 1-1-1, 1-1-2,
 
 The Pico supplies 3.3 V directly. No level shifter is needed for 3.3 V flash
 chips. For 1.8 V parts, add an external level shifter. For quad I/O, make sure
-IO2/WP# and IO3/HOLD# are wired. External pull-ups on IO2 and IO3 are still a
-good idea even though the firmware enables/holds them high when idle.
+IO2/WP# and IO3/HOLD# are wired. When idle, the firmware releases SCK,
+IO0-IO3, and CS# to input/Hi-Z so an in-system mainboard SPI controller can
+own the bus.
 
 ## Building
 
