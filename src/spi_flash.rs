@@ -10,6 +10,7 @@ use embassy_rp::Peri;
 use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::dma::Channel as DmaChannel;
 use embassy_rp::gpio::{Flex, Level, Pull};
+use embassy_rp::pac;
 use embassy_rp::peripherals::PIO0;
 use embassy_rp::pio::{
     Common, Config, Direction, FifoJoin, LoadedProgram, Pin, Pio, PioPin, ShiftConfig,
@@ -201,9 +202,27 @@ impl<'d> SpiFlash<'d> {
     }
 
     fn wp_hold_high(&mut self) {
+        // IO2 and IO3 are active-low WP# and HOLD#/RESET# in 1-bit SPI modes.
+        // Force the actual pads high with IO_BANK0 overrides while they are not
+        // PIO data lanes; setting only the PIO latch is not enough on all paths.
+        for pin in [&self.io2, &self.io3] {
+            pac::IO_BANK0.gpio(pin.pin() as usize).ctrl().modify(|w| {
+                w.set_outover(pac::io::vals::Outover::HIGH);
+                w.set_oeover(pac::io::vals::Oeover::ENABLE);
+            });
+        }
         self.sm.set_pins(Level::High, &[&self.io2, &self.io3]);
         self.sm
             .set_pin_dirs(Direction::Out, &[&self.io2, &self.io3]);
+    }
+
+    fn release_wp_hold_override(&mut self) {
+        for pin in [&self.io2, &self.io3] {
+            pac::IO_BANK0.gpio(pin.pin() as usize).ctrl().modify(|w| {
+                w.set_outover(pac::io::vals::Outover::NORMAL);
+                w.set_oeover(pac::io::vals::Oeover::NORMAL);
+            });
+        }
     }
 
     fn configure_tx(&mut self, width: u8) {
@@ -246,10 +265,13 @@ impl<'d> SpiFlash<'d> {
                     .set_pin_dirs(Direction::Out, &[&self.io0, &self.io1]);
                 self.wp_hold_high();
             }
-            _ => self.sm.set_pin_dirs(
-                Direction::Out,
-                &[&self.io0, &self.io1, &self.io2, &self.io3],
-            ),
+            _ => {
+                self.release_wp_hold_override();
+                self.sm.set_pin_dirs(
+                    Direction::Out,
+                    &[&self.io0, &self.io1, &self.io2, &self.io3],
+                );
+            }
         }
 
         self.sm.restart();
@@ -305,9 +327,11 @@ impl<'d> SpiFlash<'d> {
                 self.sm.set_pin_dirs(Direction::In, &[&self.io0, &self.io1]);
                 self.wp_hold_high();
             }
-            _ => self
-                .sm
-                .set_pin_dirs(Direction::In, &[&self.io0, &self.io1, &self.io2, &self.io3]),
+            _ => {
+                self.release_wp_hold_override();
+                self.sm
+                    .set_pin_dirs(Direction::In, &[&self.io0, &self.io1, &self.io2, &self.io3]);
+            }
         }
 
         self.active_rx_width = width;
