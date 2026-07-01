@@ -7,7 +7,7 @@
 /// machine clocks exactly the requested number of bytes and then stalls.
 use embassy_futures::join::join;
 use embassy_rp::clocks::clk_sys_freq;
-use embassy_rp::dma::{AnyChannel, Channel};
+use embassy_rp::dma::Channel as DmaChannel;
 use embassy_rp::gpio::{Flex, Level, Pull};
 use embassy_rp::peripherals::PIO0;
 use embassy_rp::pio::{
@@ -44,8 +44,8 @@ struct FlashPioPrograms<'d> {
 pub struct SpiFlash<'d> {
     _common: Pio0Common<'d>,
     sm: Pio0Sm0<'d>,
-    dma_rx: Peri<'d, AnyChannel>,
-    dma_tx: Peri<'d, AnyChannel>,
+    dma_rx: DmaChannel<'d>,
+    dma_tx: DmaChannel<'d>,
     programs: FlashPioPrograms<'d>,
     io0: Pio0Pin<'d>,
     io1: Pio0Pin<'d>,
@@ -65,8 +65,8 @@ impl<'d> SpiFlash<'d> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         mut pio: Pio<'d, PIO0>,
-        dma_rx: Peri<'d, impl Channel>,
-        dma_tx: Peri<'d, impl Channel>,
+        dma_rx: DmaChannel<'d>,
+        dma_tx: DmaChannel<'d>,
         io0: Peri<'d, impl PioPin + 'd>,
         io1: Peri<'d, impl PioPin + 'd>,
         io2: Peri<'d, impl PioPin + 'd>,
@@ -107,8 +107,8 @@ impl<'d> SpiFlash<'d> {
         let mut this = Self {
             _common: pio.common,
             sm: pio.sm0,
-            dma_rx: dma_rx.into(),
-            dma_tx: dma_tx.into(),
+            dma_rx,
+            dma_tx,
             programs,
             io0,
             io1,
@@ -622,8 +622,10 @@ impl<'d> SpiFlash<'d> {
 
         let len = buf.len();
         let (rx, tx) = self.sm.rx_tx();
-        let rx_transfer = rx.dma_pull(self.dma_rx.reborrow(), buf, false);
-        let tx_transfer = tx.dma_push_repeated::<_, u32>(self.dma_tx.reborrow(), len);
+        let mut dma_rx = self.dma_rx.reborrow();
+        let mut dma_tx = self.dma_tx.reborrow();
+        let rx_transfer = rx.dma_pull(&mut dma_rx, buf, false);
+        let tx_transfer = tx.dma_push_zeros::<u32>(&mut dma_tx, len);
         join(rx_transfer, tx_transfer).await;
 
         if self.rx_bit_correction {

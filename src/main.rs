@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+mod aux;
 mod config;
 mod leds;
 mod protocol;
@@ -14,20 +15,28 @@ use critical_section::Mutex;
 use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
+use embassy_futures::select::{select, Either};
 use embassy_rp::bind_interrupts;
-use embassy_rp::gpio::{Flex, Level, Output};
+use embassy_rp::dma::{Channel as DmaChannel, InterruptHandler as DmaInterruptHandler};
+use embassy_rp::gpio::{Flex, Input, Level, Output, OutputOpenDrain, Pull};
 use embassy_rp::pac;
-use embassy_rp::peripherals::{PIO0, USB};
+use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0, UART0, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
+use embassy_rp::uart::{
+    BufferedInterruptHandler as UartInterruptHandler, BufferedUart, BufferedUartRx, BufferedUartTx,
+};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_sync::zerocopy_channel::Channel;
-use embassy_usb::driver::{Direction, Endpoint as _, EndpointAddress, EndpointOut as _};
+use embassy_usb::driver::{
+    Direction, Endpoint as _, EndpointAddress, EndpointIn as _, EndpointOut as _,
+};
 use embassy_usb::Builder;
 use panic_probe as _;
 use static_cell::StaticCell;
 
+use crate::aux::*;
 use crate::config::*;
 use crate::leds::Leds;
 use crate::protocol::BulkOperation;
@@ -41,6 +50,8 @@ use crate::usb_handler::DediprogHandler;
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
+    UART0_IRQ => UartInterruptHandler<UART0>;
+    DMA_IRQ_0 => DmaInterruptHandler<DMA_CH0>, DmaInterruptHandler<DMA_CH1>;
 });
 
 // =============================================================================
@@ -87,7 +98,15 @@ async fn main(spawner: Spawner) {
     // Store in shared state
     critical_section::with(|cs_tok| {
         *SPI_FLASH.borrow(cs_tok).borrow_mut() = Some(SpiFlash::new(
-            pio, p.DMA_CH0, p.DMA_CH1, p.PIN_3, p.PIN_4, p.PIN_5, p.PIN_6, p.PIN_2, cs,
+            pio,
+            DmaChannel::new(p.DMA_CH0, Irqs),
+            DmaChannel::new(p.DMA_CH1, Irqs),
+            p.PIN_3,
+            p.PIN_4,
+            p.PIN_5,
+            p.PIN_6,
+            p.PIN_2,
+            cs,
         ));
     });
 
@@ -108,7 +127,7 @@ async fn main(spawner: Spawner) {
     usb_config.max_packet_size_0 = 64;
 
     // Descriptor buffers (must be 'static)
-    static CONFIG_DESC: StaticCell<[u8; 256]> = StaticCell::new();
+    static CONFIG_DESC: StaticCell<[u8; 512]> = StaticCell::new();
     static BOS_DESC: StaticCell<[u8; 256]> = StaticCell::new();
     static MSOS_DESC: StaticCell<[u8; 256]> = StaticCell::new();
     static CONTROL_BUF: StaticCell<[u8; 128]> = StaticCell::new();
@@ -116,7 +135,7 @@ async fn main(spawner: Spawner) {
     let mut builder = Builder::new(
         driver,
         usb_config,
-        CONFIG_DESC.init([0; 256]),
+        CONFIG_DESC.init([0; 512]),
         BOS_DESC.init([0; 256]),
         MSOS_DESC.init([0; 256]),
         CONTROL_BUF.init([0; 128]),
@@ -143,11 +162,47 @@ async fn main(spawner: Spawner) {
 
     drop(func); // release borrow on builder
 
+    // ---- Auxiliary vendor interface ----
+    // GP0 = UART0 TX, GP1 = UART0 RX.
+    let mut uart_config = embassy_rp::uart::Config::default();
+    uart_config.baudrate = 115_200;
+    static UART_TX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
+    static UART_RX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
+    let uart = BufferedUart::new(
+        p.UART0,
+        p.PIN_0,
+        p.PIN_1,
+        Irqs,
+        UART_TX_BUF.init([0; 256]),
+        UART_RX_BUF.init([0; 256]),
+        uart_config,
+    );
+    let (uart_tx, uart_rx) = uart.split();
+
+    // GP8 = RESET# open-drain, GP9 = POWER_SW# open-drain,
+    // GP10 = board power-state input, GP11 = auxiliary state input.
+    let board_gpio = BoardGpio::new(
+        OutputOpenDrain::new(p.PIN_8, Level::High),
+        OutputOpenDrain::new(p.PIN_9, Level::High),
+        Input::new(p.PIN_10, Pull::None),
+        Input::new(p.PIN_11, Pull::None),
+    );
+
+    let ep3_out = EndpointAddress::from_parts(3, Direction::Out);
+    let ep4_in = EndpointAddress::from_parts(4, Direction::In);
+    let mut aux_func = builder.function(0xFF, 0xD1, 0x01);
+    let mut aux_iface = aux_func.interface();
+    let mut aux_alt = aux_iface.alt_setting(0xFF, 0xD1, 0x01, None);
+    let aux_out = aux_alt.endpoint_bulk_out(Some(ep3_out), USB_MAX_PACKET_SIZE);
+    let aux_in = aux_alt.endpoint_bulk_in(Some(ep4_in), USB_MAX_PACKET_SIZE);
+    drop(aux_func);
+
     // ---- Build and launch ----
     let usb = builder.build();
 
-    spawner.must_spawn(usb_device_task(usb));
-    spawner.must_spawn(bulk_worker_task(ep_in, ep_out));
+    spawner.spawn(usb_device_task(usb).unwrap());
+    spawner.spawn(bulk_worker_task(ep_in, ep_out).unwrap());
+    spawner.spawn(aux_task(aux_out, aux_in, uart_tx, uart_rx, board_gpio).unwrap());
 
     info!("DediPico ready — VID:PID = {:04x}:{:04x}", USB_VID, USB_PID);
 
@@ -164,6 +219,113 @@ async fn main(spawner: Spawner) {
 #[embassy_executor::task]
 async fn usb_device_task(mut usb: embassy_usb::UsbDevice<'static, UsbDriver>) {
     usb.run().await;
+}
+
+// =============================================================================
+// Auxiliary vendor USB: GPIO + UART bridge
+// =============================================================================
+
+#[embassy_executor::task]
+async fn aux_task(
+    mut ep_out: <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointOut,
+    mut ep_in: <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointIn,
+    mut uart_tx: BufferedUartTx,
+    mut uart_rx: BufferedUartRx,
+    mut gpio: BoardGpio<'static>,
+) {
+    let mut usb_buf = [0u8; FRAME_LEN];
+    let mut uart_buf = [0u8; FRAME_LEN - 2];
+
+    loop {
+        ep_out.wait_enabled().await;
+        ep_in.wait_enabled().await;
+
+        match select(
+            ep_out.read(&mut usb_buf),
+            embedded_io_async::Read::read(&mut uart_rx, &mut uart_buf),
+        )
+        .await
+        {
+            Either::First(Ok(n)) => {
+                handle_aux_frame(&mut ep_in, &mut uart_tx, &mut gpio, &usb_buf[..n]).await;
+            }
+            Either::First(Err(_)) => {}
+            Either::Second(Ok(0) | Err(_)) => {}
+            Either::Second(Ok(n)) => {
+                let mut frame = [0u8; FRAME_LEN];
+                frame[0] = EVT_UART_DATA;
+                frame[1] = n as u8;
+                frame[2..2 + n].copy_from_slice(&uart_buf[..n]);
+                let _ = ep_in.write(&frame).await;
+            }
+        }
+    }
+}
+
+async fn handle_aux_frame(
+    ep_in: &mut <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointIn,
+    uart_tx: &mut BufferedUartTx,
+    gpio: &mut BoardGpio<'static>,
+    frame: &[u8],
+) {
+    match frame.first().copied() {
+        Some(CMD_GPIO_GET_STATE) => {
+            let _ = ep_in.write(&gpio.state_frame()).await;
+        }
+        Some(CMD_GPIO_SET_DIRECTION) if frame.len() >= 3 => {
+            gpio.set_direction(frame[1], frame[2]);
+            let _ = ep_in.write(&gpio.state_frame()).await;
+        }
+        Some(CMD_GPIO_SET_OUTPUT) if frame.len() >= 3 => {
+            gpio.set_output(frame[1], frame[2]);
+            let _ = ep_in.write(&gpio.state_frame()).await;
+        }
+        Some(CMD_GPIO_PULSE_LOW) if frame.len() >= 4 => {
+            gpio.pulse_low(frame[1], u16::from_le_bytes([frame[2], frame[3]]))
+                .await;
+            let _ = ep_in.write(&gpio.state_frame()).await;
+        }
+        Some(CMD_UART_SET_BAUD) if frame.len() >= 5 => {
+            set_uart0_baudrate(u32::from_le_bytes([frame[1], frame[2], frame[3], frame[4]]));
+        }
+        Some(CMD_UART_WRITE) if frame.len() >= 2 => {
+            let len = (frame[1] as usize).min(frame.len().saturating_sub(2));
+            write_all_uart(uart_tx, &frame[2..2 + len]).await;
+        }
+        _ => {}
+    }
+}
+
+async fn write_all_uart(uart_tx: &mut BufferedUartTx, mut data: &[u8]) {
+    while !data.is_empty() {
+        match embedded_io_async::Write::write(uart_tx, data).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => data = &data[n..],
+        }
+    }
+}
+
+fn set_uart0_baudrate(baudrate: u32) {
+    let baudrate = baudrate.clamp(300, 3_000_000);
+    let clk_base = embassy_rp::clocks::clk_peri_freq();
+    let baud_rate_div = (8 * clk_base) / baudrate;
+    let mut baud_ibrd = baud_rate_div >> 7;
+    let mut baud_fbrd = (baud_rate_div & 0x7f).div_ceil(2);
+
+    if baud_ibrd == 0 {
+        baud_ibrd = 1;
+        baud_fbrd = 0;
+    } else if baud_ibrd >= 65535 {
+        baud_ibrd = 65535;
+        baud_fbrd = 0;
+    }
+
+    let regs = pac::UART0;
+    regs.uartibrd()
+        .write_value(pac::uart::regs::Uartibrd(baud_ibrd));
+    regs.uartfbrd()
+        .write_value(pac::uart::regs::Uartfbrd(baud_fbrd));
+    regs.uartlcr_h().modify(|_| {});
 }
 
 // =============================================================================

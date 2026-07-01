@@ -1,1 +1,4 @@
 /target
+
+# Host tools
+tools/dedipicoctl/target/
