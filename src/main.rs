@@ -16,6 +16,7 @@ use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
+use embassy_rp::Peri;
 use embassy_rp::bind_interrupts;
 use embassy_rp::dma::{Channel as DmaChannel, InterruptHandler as DmaInterruptHandler};
 use embassy_rp::gpio::{Flex, Input, Level, Output, OutputOpenDrain, Pull};
@@ -24,7 +25,6 @@ use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIN_0, PIN_1, PIO0, PIO1, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::pio_programs::uart::{PioUartRx, PioUartRxProgram, PioUartTx, PioUartTxProgram};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
-use embassy_rp::Peri;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_sync::zerocopy_channel::Channel;
@@ -32,6 +32,8 @@ use embassy_usb::Builder;
 use embassy_usb::driver::{
     Direction, Endpoint as _, EndpointAddress, EndpointIn as _, EndpointOut as _,
 };
+use fixed::traits::ToFixed;
+use fixed::types::extra::U8;
 use panic_probe as _;
 use static_cell::StaticCell;
 
@@ -199,7 +201,17 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(usb_device_task(usb).unwrap());
     spawner.spawn(bulk_worker_task(ep_in, ep_out).unwrap());
-    spawner.spawn(aux_task(aux_out, aux_in, uart_pio, uart_tx_pin, uart_rx_pin, board_gpio).unwrap());
+    spawner.spawn(
+        aux_task(
+            aux_out,
+            aux_in,
+            uart_pio,
+            uart_tx_pin,
+            uart_rx_pin,
+            board_gpio,
+        )
+        .unwrap(),
+    );
 
     info!("DediPico ready — VID:PID = {:04x}:{:04x}", USB_VID, USB_PID);
 
@@ -320,14 +332,26 @@ async fn handle_aux_frame(
             let _ = ep_in.write(&gpio.state_frame()).await;
         }
         Some(CMD_UART_SET_BAUD) if frame.len() >= 5 => {
-            // The PIO UART starts at 115200 baud. Runtime retiming can be added
-            // later if the aux protocol needs non-default rates.
+            set_pio1_uart_baudrate(u32::from_le_bytes([frame[1], frame[2], frame[3], frame[4]]));
         }
         Some(CMD_UART_WRITE) if frame.len() >= 2 => {
             let len = (frame[1] as usize).min(frame.len().saturating_sub(2));
             let _ = embedded_io_async::Write::write_all(uart_tx, &frame[2..2 + len]).await;
         }
         _ => {}
+    }
+}
+
+fn set_pio1_uart_baudrate(baudrate: u32) {
+    let baudrate = baudrate.clamp(300, 3_000_000);
+    let divider =
+        (embassy_rp::clocks::clk_sys_freq() / (8 * baudrate)).to_fixed::<fixed::FixedU32<U8>>();
+
+    for sm in 0..=1 {
+        pac::PIO1
+            .sm(sm)
+            .clkdiv()
+            .write(|w| w.0 = divider.to_bits() << 8);
     }
 }
 
