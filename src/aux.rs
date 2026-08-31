@@ -1,7 +1,9 @@
 use embassy_rp::gpio::{Input, OutputOpenDrain};
-use embassy_time::Timer;
+use embassy_time::{Duration, Instant};
 
-pub const FRAME_LEN: usize = 64;
+pub const PACKET_LEN: usize = 64;
+pub const HEADER_LEN: usize = 3;
+pub const MAX_PAYLOAD_LEN: usize = PACKET_LEN - HEADER_LEN;
 
 pub const CMD_GPIO_GET_STATE: u8 = 0x01;
 pub const CMD_GPIO_SET_DIRECTION: u8 = 0x02;
@@ -10,14 +12,27 @@ pub const CMD_GPIO_PULSE_LOW: u8 = 0x04;
 pub const CMD_UART_SET_BAUD: u8 = 0x10;
 pub const CMD_UART_WRITE: u8 = 0x11;
 
+pub const EVT_RESPONSE: u8 = 0x80;
 pub const EVT_GPIO_STATE: u8 = 0x81;
 pub const EVT_UART_DATA: u8 = 0x90;
+
+pub const STATUS_OK: u8 = 0;
+pub const STATUS_INVALID: u8 = 1;
+pub const STATUS_BUSY: u8 = 2;
 
 const GPIO_COUNT: u8 = 4;
 const GPIO_RESET: u8 = 1 << 0;
 const GPIO_POWER: u8 = 1 << 1;
 const CAP_OPEN_DRAIN: u8 = 1 << 0;
 const CAP_PULSE: u8 = 1 << 1;
+
+#[derive(Clone, Copy)]
+struct Pulse {
+    pins: u8,
+    old_directions: u8,
+    old_outputs: u8,
+    deadline: Instant,
+}
 
 pub struct BoardGpio<'d> {
     reset: OutputOpenDrain<'d>,
@@ -26,6 +41,7 @@ pub struct BoardGpio<'d> {
     aux_state: Input<'d>,
     outputs: u8,
     directions: u8,
+    pulse: Option<Pulse>,
 }
 
 impl<'d> BoardGpio<'d> {
@@ -42,40 +58,71 @@ impl<'d> BoardGpio<'d> {
             aux_state,
             outputs: GPIO_RESET | GPIO_POWER,
             directions: 0,
+            pulse: None,
         }
     }
 
-    pub fn state_frame(&mut self) -> [u8; FRAME_LEN] {
-        let mut frame = [0; FRAME_LEN];
-        frame[0] = EVT_GPIO_STATE;
-        frame[1] = self.inputs();
-        frame[2] = self.outputs;
-        frame[3] = self.directions;
-        frame[4] = GPIO_COUNT | CAP_OPEN_DRAIN | CAP_PULSE;
-        frame
+    pub fn state(&mut self) -> [u8; 4] {
+        [
+            self.inputs(),
+            self.outputs,
+            self.directions,
+            GPIO_COUNT | CAP_OPEN_DRAIN | CAP_PULSE,
+        ]
     }
 
     pub fn set_direction(&mut self, mask: u8, directions: u8) {
+        self.finish_pulse();
         self.directions = (self.directions & !mask) | (directions & mask);
         self.apply_outputs();
     }
 
     pub fn set_output(&mut self, mask: u8, values: u8) {
+        self.finish_pulse();
         self.outputs = (self.outputs & !mask) | (values & mask);
         self.apply_outputs();
     }
 
-    pub async fn pulse_low(&mut self, mask: u8, ms: u16) {
+    pub fn start_pulse_low(&mut self, mask: u8, duration_ms: u16) {
+        self.finish_pulse();
+
         let pins = mask & (GPIO_RESET | GPIO_POWER);
-        let old_directions = self.directions;
-        let old_outputs = self.outputs;
+        let pulse = Pulse {
+            pins,
+            old_directions: self.directions,
+            old_outputs: self.outputs,
+            deadline: Instant::now() + Duration::from_millis(duration_ms as u64),
+        };
 
         self.directions |= pins;
         self.outputs &= !pins;
         self.apply_outputs();
-        Timer::after_millis(ms as u64).await;
-        self.directions = old_directions;
-        self.outputs = old_outputs;
+        self.pulse = Some(pulse);
+    }
+
+    pub fn pulse_deadline(&self) -> Option<Instant> {
+        self.pulse.map(|pulse| pulse.deadline)
+    }
+
+    pub fn finish_pulse_if_due(&mut self) -> bool {
+        if self
+            .pulse
+            .is_some_and(|pulse| pulse.deadline <= Instant::now())
+        {
+            self.finish_pulse();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn finish_pulse(&mut self) {
+        let Some(pulse) = self.pulse.take() else {
+            return;
+        };
+
+        self.directions = (self.directions & !pulse.pins) | (pulse.old_directions & pulse.pins);
+        self.outputs = (self.outputs & !pulse.pins) | (pulse.old_outputs & pulse.pins);
         self.apply_outputs();
     }
 

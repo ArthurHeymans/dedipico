@@ -5,7 +5,7 @@ Rust with Embassy. Lets you use `flashprog` (or `flashrom`) with a $4 Pico
 as a USB-to-SPI flash programmer. The flash bus is implemented entirely with
 RP2040 PIO so the same engine can handle single, dual, and quad SPI phases.
 
-```
+```text
 [Host PC: flashprog] --USB--> [Raspberry Pi Pico] --SPI--> [SPI Flash Chip]
 ```
 
@@ -35,12 +35,12 @@ the PIO programs switch those pins between output and input for 1-1-1, 1-1-2,
 
 ### Board control GPIO
 
-| Function          | Pico Pin | GPIO | Direction |
-|-------------------|----------|------|-----------|
+| Function          | Pico Pin | GPIO | Direction         |
+|-------------------|----------|------|-------------------|
 | RESET#            | 11       | GP8  | open-drain output |
 | POWER_SW#         | 12       | GP9  | open-drain output |
-| Board power state | 14       | GP10 | input |
-| Auxiliary state   | 15       | GP11 | input |
+| Board power state | 14       | GP10 | input             |
+| Auxiliary state   | 15       | GP11 | input             |
 
 RESET# and POWER_SW# only pull low or release; they never drive high. Hold
 POWER_SW# low for about 5 s to request power-off on ATX-style boards.
@@ -55,7 +55,7 @@ POWER_SW# low for about 5 s to request power-off on ATX-style boards.
 
 ### Wiring diagram
 
-```
+```text
             Raspberry Pi Pico
            ┌─────────────────┐
            │               GP2├──── SCK
@@ -90,7 +90,7 @@ own the bus.
 
 ## Building
 
-```
+```bash
 rustup target add thumbv6m-none-eabi
 cargo build --release
 ```
@@ -108,13 +108,13 @@ cargo build --release
 
 With a debug probe (another Pico running debugprobe, a CMSIS-DAP adapter, etc.):
 
-```
+```bash
 cargo run --release
 ```
 
 Or build the UF2 yourself and copy it to the Pico's mass-storage bootloader:
 
-```
+```bash
 cargo install elf2uf2-rs --no-default-features
 elf2uf2-rs target/thumbv6m-none-eabi/release/dedipico dedipico.uf2
 # hold BOOTSEL, plug in Pico, copy dedipico.uf2 to the RPI-RP2 drive
@@ -167,47 +167,60 @@ Supported commands: `TRANSCEIVE`, `READ`, `WRITE`, `SET_VCC`, `SET_SPI_CLK`,
 (`SET_VPP`, `SET_HOLD`, `GET_BUTTON`, `GET_UID`, `READ_FPGA_VERSION`,
 `CHECK_SOCKET`, etc.).
 
-The auxiliary interface uses fixed 64-byte frames. Host-to-device commands:
+The auxiliary interface uses variable-length packets of up to 64 bytes. Every
+packet starts with `[type, request_id, payload_len]`. A nonzero request ID asks
+the device to return a correlated response; request ID zero is reserved for
+unsolicited events.
 
-- `0x01` GPIO_GET_STATE
-- `0x02` GPIO_SET_DIRECTION: `[0x02, mask, directions, ...]`
-- `0x03` GPIO_SET_OUTPUT: `[0x03, mask, values, ...]`
-- `0x04` GPIO_PULSE_LOW: `[0x04, mask, ms_lo, ms_hi, ...]`
-- `0x10` UART_SET_BAUD: `[0x10, baud_le32, ...]`
-- `0x11` UART_WRITE: `[0x11, len, payload...]`
+Host-to-device commands and their payloads:
 
-Device-to-host events:
+- `0x01` GPIO_GET_STATE: `[]`
+- `0x02` GPIO_SET_DIRECTION: `[mask, directions]`
+- `0x03` GPIO_SET_OUTPUT: `[mask, values]`
+- `0x04` GPIO_PULSE_LOW: `[mask, ms_lo, ms_hi]`
+- `0x10` UART_SET_BAUD: `[baud_le32]`
+- `0x11` UART_WRITE: UART bytes
 
-- `0x81` GPIO_STATE: `[0x81, inputs, outputs, directions, caps, ...]`
-- `0x90` UART_DATA: `[0x90, len, payload...]`
+Device-to-host packets:
 
-GPIO bits: bit0 RESET#, bit1 POWER_SW#, bit2 board power state, bit3 auxiliary
-state. For RESET#/POWER_SW#, direction=0 releases the pin; direction=1 with
-output=0 pulls it low.
+- `0x80` RESPONSE: `[command, status, data...]`
+- `0x81` GPIO_STATE event: `[inputs, outputs, directions, caps]`
+- `0x90` UART_DATA event: batched UART bytes
 
-Use the Rust `dedipicoctl` tool for GPIO and UART:
+GPIO command responses include the four-byte GPIO state as their response data.
+GPIO bits are bit0 RESET#, bit1 POWER_SW#, bit2 board power state, and bit3
+auxiliary state. For RESET#/POWER_SW#, direction=0 releases the pin; direction=1
+with output=0 pulls it low.
+
+UART input is accumulated until the 61-byte payload is full or a 1 ms deadline
+from the first buffered byte expires. GPIO responses are serviced before queued
+UART data. UART RX and TX use bounded queues so a stalled terminal cannot block
+board management. Power/reset pulses are acknowledged immediately and released
+by a timer without blocking other auxiliary work.
+
+`dedipicoctl daemon` is the only process that claims the auxiliary USB
+interface. It prints a UART pseudo-terminal and listens on a per-user Unix
+socket for management commands:
 
 ```bash
-# read GPIO state
-(cd tools/dedipicoctl && cargo run --release -- state)
+# terminal 1: keep the daemon running
+(cd tools/dedipicoctl && cargo run --release --target x86_64-unknown-linux-gnu -- daemon 115200)
+# pty: /dev/pts/N
+# socket: /run/user/1000/dedipico.sock
 
-# pulse reset for 100 ms
-(cd tools/dedipicoctl && cargo run --release -- reset)
+# terminal 2: connect a terminal program to the printed PTY
+picocom /dev/pts/N
 
-# short power-button press
-(cd tools/dedipicoctl && cargo run --release -- power)
-
-# 5 s power-button press for power-off
-(cd tools/dedipicoctl && cargo run --release -- poweroff)
-
-# create a pseudo-terminal for UART and print its path
-(cd tools/dedipicoctl && cargo run --release -- tty 115200)
+# management commands go through the daemon while UART remains active
+(cd tools/dedipicoctl && cargo run --release --target x86_64-unknown-linux-gnu -- state)
+(cd tools/dedipicoctl && cargo run --release --target x86_64-unknown-linux-gnu -- reset)
+(cd tools/dedipicoctl && cargo run --release --target x86_64-unknown-linux-gnu -- power)
+(cd tools/dedipicoctl && cargo run --release --target x86_64-unknown-linux-gnu -- poweroff)
 ```
 
-The `tty` command prints a `/dev/pts/N` path; use that with `picocom`, `screen`,
-or similar terminal tools. Do not keep `dedipicoctl tty` running while starting
-stock `flashprog`; both use the auxiliary USB interface. Short GPIO commands
-exit immediately and do not have this issue.
+Use `--socket PATH` on both daemon and client commands to override the socket
+location. The daemon owns interface 1 while `flashprog` uses interface 0, so
+they can remain active at the same time.
 
 ## Limitations
 
