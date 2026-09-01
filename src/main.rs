@@ -15,7 +15,7 @@ use critical_section::Mutex;
 use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{Either4, select4};
 use embassy_rp::Peri;
 use embassy_rp::bind_interrupts;
 use embassy_rp::dma::{Channel as DmaChannel, InterruptHandler as DmaInterruptHandler};
@@ -26,8 +26,10 @@ use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::pio_programs::uart::{PioUartRx, PioUartRxProgram, PioUartTx, PioUartTxProgram};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel as SyncChannel;
 use embassy_sync::signal::Signal;
 use embassy_sync::zerocopy_channel::Channel;
+use embassy_time::{Duration, Instant, Timer};
 use embassy_usb::Builder;
 use embassy_usb::driver::{
     Direction, Endpoint as _, EndpointAddress, EndpointIn as _, EndpointOut as _,
@@ -68,6 +70,12 @@ pub static BULK_OP: Mutex<RefCell<Option<BulkOperation>>> = Mutex::new(RefCell::
 
 /// Signal to wake the worker task when a bulk operation is ready.
 pub static BULK_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// Decouples the PIO UART receiver from USB scheduling. If the host stops
+/// draining the endpoint, new UART bytes are dropped rather than blocking GPIO
+/// management indefinitely.
+static UART_RX: SyncChannel<CriticalSectionRawMutex, u8, 256> = SyncChannel::new();
+static UART_TX: SyncChannel<CriticalSectionRawMutex, u8, 256> = SyncChannel::new();
 
 const FLASH_WP_PIN: usize = 5;
 const FLASH_HOLD_PIN: usize = 6;
@@ -203,6 +211,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(bulk_worker_task(ep_in, ep_out).unwrap());
     spawner.spawn(
         aux_task(
+            spawner,
             aux_out,
             aux_in,
             uart_pio,
@@ -265,7 +274,26 @@ async fn usb_device_task(mut usb: embassy_usb::UsbDevice<'static, UsbDriver>) {
 // =============================================================================
 
 #[embassy_executor::task]
+async fn uart_rx_task(mut uart_rx: PioUartRx<'static, PIO1, 1>) {
+    loop {
+        let byte = uart_rx.read_u8().await;
+        // Management must remain usable even if no host is consuming UART.
+        // The bounded queue makes overload explicit: newest bytes are dropped.
+        let _ = UART_RX.try_send(byte);
+    }
+}
+
+#[embassy_executor::task]
+async fn uart_tx_task(mut uart_tx: PioUartTx<'static, PIO1, 0>) {
+    loop {
+        let byte = UART_TX.receive().await;
+        let _ = embedded_io_async::Write::write_all(&mut uart_tx, &[byte]).await;
+    }
+}
+
+#[embassy_executor::task]
 async fn aux_task(
+    spawner: Spawner,
     mut ep_out: <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointOut,
     mut ep_in: <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointIn,
     uart_pio: Peri<'static, PIO1>,
@@ -281,64 +309,166 @@ async fn aux_task(
     } = Pio::new(uart_pio, Irqs);
 
     let tx_prog = PioUartTxProgram::new(&mut common);
-    let mut uart_tx = PioUartTx::new(115_200, &mut common, sm0, uart_tx_pin, &tx_prog);
+    let uart_tx = PioUartTx::new(115_200, &mut common, sm0, uart_tx_pin, &tx_prog);
 
     let rx_prog = PioUartRxProgram::new(&mut common);
-    let mut uart_rx = PioUartRx::new(115_200, &mut common, sm1, uart_rx_pin, &rx_prog);
+    let uart_rx = PioUartRx::new(115_200, &mut common, sm1, uart_rx_pin, &rx_prog);
+    spawner.spawn(uart_rx_task(uart_rx).unwrap());
+    spawner.spawn(uart_tx_task(uart_tx).unwrap());
 
-    let mut usb_buf = [0u8; FRAME_LEN];
+    let mut usb_buf = [0u8; PACKET_LEN];
+    let mut uart_buf = [0u8; MAX_PAYLOAD_LEN];
+    let mut uart_len = 0;
+    let mut uart_deadline = None;
 
     loop {
         ep_out.wait_enabled().await;
         ep_in.wait_enabled().await;
 
-        match select(ep_out.read(&mut usb_buf), uart_rx.read_u8()).await {
-            Either::First(Ok(n)) => {
-                handle_aux_frame(&mut ep_in, &mut uart_tx, &mut gpio, &usb_buf[..n]).await;
+        let flush_at = uart_deadline.unwrap_or(Instant::MAX);
+        let pulse_at = gpio.pulse_deadline().unwrap_or(Instant::MAX);
+
+        match select4(
+            ep_out.read(&mut usb_buf),
+            Timer::at(pulse_at),
+            Timer::at(flush_at),
+            UART_RX.receive(),
+        )
+        .await
+        {
+            Either4::First(Ok(n)) => {
+                handle_aux_packet(&mut ep_in, &mut gpio, &usb_buf[..n]).await;
             }
-            Either::First(Err(_)) => {}
-            Either::Second(byte) => {
-                let mut frame = [0u8; FRAME_LEN];
-                frame[0] = EVT_UART_DATA;
-                frame[1] = 1;
-                frame[2] = byte;
-                let _ = ep_in.write(&frame).await;
+            Either4::First(Err(_)) => {}
+            Either4::Second(()) => {
+                if gpio.finish_pulse_if_due() {
+                    write_packet(&mut ep_in, EVT_GPIO_STATE, 0, &gpio.state()).await;
+                }
+            }
+            Either4::Third(()) => {
+                flush_uart(&mut ep_in, &mut uart_buf, &mut uart_len).await;
+                uart_deadline = None;
+            }
+            Either4::Fourth(byte) => {
+                if uart_len == 0 {
+                    uart_deadline = Some(Instant::now() + Duration::from_millis(1));
+                }
+                uart_buf[uart_len] = byte;
+                uart_len += 1;
+                if uart_len == uart_buf.len() {
+                    flush_uart(&mut ep_in, &mut uart_buf, &mut uart_len).await;
+                    uart_deadline = None;
+                }
             }
         }
     }
 }
 
-async fn handle_aux_frame(
+async fn flush_uart(
     ep_in: &mut <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointIn,
-    uart_tx: &mut PioUartTx<'static, PIO1, 0>,
-    gpio: &mut BoardGpio<'static>,
-    frame: &[u8],
+    uart_buf: &mut [u8; MAX_PAYLOAD_LEN],
+    uart_len: &mut usize,
 ) {
-    match frame.first().copied() {
-        Some(CMD_GPIO_GET_STATE) => {
-            let _ = ep_in.write(&gpio.state_frame()).await;
+    if *uart_len != 0 {
+        write_packet(ep_in, EVT_UART_DATA, 0, &uart_buf[..*uart_len]).await;
+        *uart_len = 0;
+    }
+}
+
+async fn write_packet(
+    ep_in: &mut <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointIn,
+    kind: u8,
+    request_id: u8,
+    payload: &[u8],
+) {
+    let payload = &payload[..payload.len().min(MAX_PAYLOAD_LEN)];
+    let mut packet = [0u8; PACKET_LEN];
+    packet[0] = kind;
+    packet[1] = request_id;
+    packet[2] = payload.len() as u8;
+    packet[HEADER_LEN..HEADER_LEN + payload.len()].copy_from_slice(payload);
+    let _ = ep_in.write(&packet[..HEADER_LEN + payload.len()]).await;
+}
+
+async fn write_response(
+    ep_in: &mut <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointIn,
+    request_id: u8,
+    command: u8,
+    status: u8,
+    data: &[u8],
+) {
+    let data = &data[..data.len().min(MAX_PAYLOAD_LEN - 2)];
+    let mut payload = [0u8; MAX_PAYLOAD_LEN];
+    payload[0] = command;
+    payload[1] = status;
+    payload[2..2 + data.len()].copy_from_slice(data);
+    write_packet(ep_in, EVT_RESPONSE, request_id, &payload[..2 + data.len()]).await;
+}
+
+async fn handle_aux_packet(
+    ep_in: &mut <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointIn,
+    gpio: &mut BoardGpio<'static>,
+    packet: &[u8],
+) {
+    if packet.len() < HEADER_LEN {
+        return;
+    }
+
+    let command = packet[0];
+    let request_id = packet[1];
+    let payload_len = (packet[2] as usize).min(packet.len() - HEADER_LEN);
+    let payload = &packet[HEADER_LEN..HEADER_LEN + payload_len];
+
+    let status = match command {
+        CMD_GPIO_GET_STATE if payload.is_empty() => STATUS_OK,
+        CMD_GPIO_SET_DIRECTION if payload.len() == 2 => {
+            gpio.set_direction(payload[0], payload[1]);
+            STATUS_OK
         }
-        Some(CMD_GPIO_SET_DIRECTION) if frame.len() >= 3 => {
-            gpio.set_direction(frame[1], frame[2]);
-            let _ = ep_in.write(&gpio.state_frame()).await;
+        CMD_GPIO_SET_OUTPUT if payload.len() == 2 => {
+            gpio.set_output(payload[0], payload[1]);
+            STATUS_OK
         }
-        Some(CMD_GPIO_SET_OUTPUT) if frame.len() >= 3 => {
-            gpio.set_output(frame[1], frame[2]);
-            let _ = ep_in.write(&gpio.state_frame()).await;
+        CMD_GPIO_PULSE_LOW if payload.len() == 3 => {
+            gpio.start_pulse_low(payload[0], u16::from_le_bytes([payload[1], payload[2]]));
+            STATUS_OK
         }
-        Some(CMD_GPIO_PULSE_LOW) if frame.len() >= 4 => {
-            gpio.pulse_low(frame[1], u16::from_le_bytes([frame[2], frame[3]]))
-                .await;
-            let _ = ep_in.write(&gpio.state_frame()).await;
+        CMD_UART_SET_BAUD if payload.len() == 4 => {
+            set_pio1_uart_baudrate(u32::from_le_bytes([
+                payload[0], payload[1], payload[2], payload[3],
+            ]));
+            STATUS_OK
         }
-        Some(CMD_UART_SET_BAUD) if frame.len() >= 5 => {
-            set_pio1_uart_baudrate(u32::from_le_bytes([frame[1], frame[2], frame[3], frame[4]]));
+        CMD_UART_WRITE if UART_TX.free_capacity() >= payload.len() => {
+            for &byte in payload {
+                let _ = UART_TX.try_send(byte);
+            }
+            STATUS_OK
         }
-        Some(CMD_UART_WRITE) if frame.len() >= 2 => {
-            let len = (frame[1] as usize).min(frame.len().saturating_sub(2));
-            let _ = embedded_io_async::Write::write_all(uart_tx, &frame[2..2 + len]).await;
-        }
-        _ => {}
+        CMD_UART_WRITE => STATUS_BUSY,
+        _ => STATUS_INVALID,
+    };
+
+    if request_id != 0 {
+        let state = match command {
+            CMD_GPIO_GET_STATE
+            | CMD_GPIO_SET_DIRECTION
+            | CMD_GPIO_SET_OUTPUT
+            | CMD_GPIO_PULSE_LOW
+                if status == STATUS_OK =>
+            {
+                Some(gpio.state())
+            }
+            _ => None,
+        };
+        write_response(
+            ep_in,
+            request_id,
+            command,
+            status,
+            state.as_ref().map_or(&[], |state| state.as_slice()),
+        )
+        .await;
     }
 }
 
