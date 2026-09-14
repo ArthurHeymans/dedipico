@@ -270,7 +270,7 @@ checksum = "80a4af69c60438a1a82af89d362f4729fd38db7b73f305a237636fad31ceb2bf"
 
 [[package]]
 name = "dedipico"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
