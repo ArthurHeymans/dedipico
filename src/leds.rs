@@ -1,17 +1,22 @@
 /// LED control for Pass / Busy / Error indicators.
+use core::cell::RefCell;
+
+use critical_section::Mutex;
 use embassy_rp::gpio::Output;
 
 use crate::config;
 
+static ERROR_LED: Mutex<RefCell<Option<Output<'static>>>> = Mutex::new(RefCell::new(None));
+
 pub struct Leds<'d> {
     pass: Output<'d>,
     busy: Output<'d>,
-    error: Output<'d>,
 }
 
 impl<'d> Leds<'d> {
-    pub fn new(pass: Output<'d>, busy: Output<'d>, error: Output<'d>) -> Self {
-        Self { pass, busy, error }
+    pub fn new(pass: Output<'d>, busy: Output<'d>, error: Output<'static>) -> Self {
+        critical_section::with(|cs| *ERROR_LED.borrow(cs).borrow_mut() = Some(error));
+        Self { pass, busy }
     }
 
     /// Set LED state from the raw wValue of CMD_SET_IO_LED (Protocol V2).
@@ -37,11 +42,7 @@ impl<'d> Leds<'d> {
         } else {
             self.busy.set_low();
         }
-        if state & config::LED_ERROR != 0 {
-            self.error.set_high();
-        } else {
-            self.error.set_low();
-        }
+        set_error(state & config::LED_ERROR != 0);
     }
 
     /// All LEDs off.
@@ -59,4 +60,17 @@ impl<'d> Leds<'d> {
             self.busy.set_low();
         }
     }
+}
+
+/// Set the error LED from either the control handler or the bulk worker.
+pub fn set_error(on: bool) {
+    critical_section::with(|cs| {
+        if let Some(error) = ERROR_LED.borrow(cs).borrow_mut().as_mut() {
+            if on {
+                error.set_high();
+            } else {
+                error.set_low();
+            }
+        }
+    });
 }

@@ -114,13 +114,6 @@ impl DediPico {
     }
 
     fn write_packet(&mut self, kind: u8, request_id: u8, payload: &[u8]) -> io::Result<()> {
-        if payload.len() > MAX_PAYLOAD_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "auxiliary packet payload is too large",
-            ));
-        }
-
         let mut packet = [0u8; PACKET_LEN];
         let packet = encode(&mut packet, kind, request_id, payload).ok_or_else(|| {
             io::Error::new(

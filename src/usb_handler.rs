@@ -7,7 +7,7 @@ use defmt::*;
 use embassy_usb::Handler;
 use embassy_usb::control::{InResponse, OutResponse, Request, RequestType};
 
-use crate::bulk::{put_flash, submit, take_flash_for_control};
+use crate::bulk::{cancel, put_flash, submit, take_flash_for_control};
 use crate::leds::Leds;
 use crate::protocol::*;
 
@@ -271,7 +271,7 @@ impl DediprogHandler {
         if submit(op) {
             Some(OutResponse::Accepted)
         } else {
-            warn!("READ setup while another bulk operation is pending");
+            warn!("READ setup while the follow-up queue is full");
             Some(OutResponse::Rejected)
         }
     }
@@ -311,7 +311,7 @@ impl DediprogHandler {
         if submit(op) {
             Some(OutResponse::Accepted)
         } else {
-            warn!("WRITE setup while another bulk operation is pending");
+            warn!("WRITE setup while the follow-up queue is full");
             Some(OutResponse::Rejected)
         }
     }
@@ -351,6 +351,7 @@ impl Handler for DediprogHandler {
             info!("USB configured");
         } else {
             info!("USB deconfigured");
+            cancel();
         }
     }
 
@@ -412,8 +413,7 @@ impl Handler for DediprogHandler {
             CMD_SET_VOLTAGE => self.cmd_set_voltage_legacy(req, buf),
             CMD_GET_BUTTON => self.cmd_get_button(req, buf),
             CMD_GET_UID => {
-                // Return a fixed 8-byte UID.
-                let uid: [u8; 8] = [0xDE, 0xD1, 0x01, 0xC0, 0x00, 0x00, 0x00, 0x01];
+                let uid = self.identity.unique_id();
                 let len = uid.len().min(buf.len());
                 buf[..len].copy_from_slice(&uid[..len]);
                 Some(InResponse::Accepted(&buf[..len]))

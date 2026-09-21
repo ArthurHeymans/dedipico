@@ -16,7 +16,7 @@ use embassy_rp::pio::{
     Common, Config, Direction, FifoJoin, LoadedProgram, Pin, Pio, PioPin, ShiftConfig,
     ShiftDirection, StateMachine,
 };
-use embassy_time::{Duration, Instant};
+use embassy_time::{Duration, Instant, with_timeout};
 use fixed::traits::ToFixed;
 use fixed::types::U24F8;
 use fixed::types::extra::U8;
@@ -32,12 +32,15 @@ type Pio0Program<'d> = LoadedProgram<'d, PIO0>;
 
 const PIO_CYCLES_PER_SCK: u32 = 5;
 const PIO_WAIT_TIMEOUT_ITERS: u32 = 10_000;
-const PAGE_PROGRAM_TIMEOUT: Duration = Duration::from_secs(5);
+const PAGE_PROGRAM_TIMEOUT: Duration = Duration::from_millis(250);
+const DMA_BLOCK_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, defmt::Format)]
 pub enum SpiError {
     PioTimeout,
+    FlashBusy,
     FlashBusyTimeout,
+    Cancelled,
 }
 
 struct FlashPioPrograms<'d> {
@@ -574,7 +577,8 @@ impl<'d> SpiFlash<'d> {
 
     /// Begin a read sequence. Opcode is 1-bit unless QPI is requested.
     /// Address/mode/data phases follow the current Dediprog I/O mode.
-    pub async fn start_read(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_read<F: Fn() -> bool>(
         &mut self,
         opcode: u8,
         address: u32,
@@ -582,8 +586,9 @@ impl<'d> SpiFlash<'d> {
         io_mode: IoMode,
         mode_byte: Option<u8>,
         dummy_cycles: u8,
-    ) {
-        self.wait_for_forced_busy_window().await;
+        cancelled: F,
+    ) -> Result<(), SpiError> {
+        self.check_forced_busy_window(&cancelled)?;
 
         self.cs_assert();
 
@@ -593,7 +598,10 @@ impl<'d> SpiFlash<'d> {
 
         if opcode_width == 1 {
             self.configure_duplex1();
-            let _ = self.duplex1_write_read_byte_configured(opcode);
+            if self.duplex1_write_read_byte_configured(opcode).is_none() {
+                self.cs_deassert();
+                return Err(SpiError::PioTimeout);
+            }
         } else {
             self.write_byte_width(opcode, opcode_width);
         }
@@ -604,15 +612,24 @@ impl<'d> SpiFlash<'d> {
             // reconfigured for a multi-lane address/read phase; EM100 traces saw
             // 0xbb degraded to 0xba in that case.
             self.configure_duplex1();
-            let _ = self.write_address_1bit_duplex_configured(address, addr_len);
-            if let Some(mode) = mode_byte {
-                let _ = self.duplex1_write_read_byte_configured(mode);
+            if !self.write_address_1bit_duplex_configured(address, addr_len) {
+                self.cs_deassert();
+                return Err(SpiError::PioTimeout);
+            }
+            if let Some(mode) = mode_byte
+                && self.duplex1_write_read_byte_configured(mode).is_none()
+            {
+                self.cs_deassert();
+                return Err(SpiError::PioTimeout);
             }
             if dummy_cycles > 0 && read_width == 1 {
                 let cycles_per_byte = 8 / read_width;
                 let bytes = dummy_cycles.div_ceil(cycles_per_byte);
                 for _ in 0..bytes {
-                    let _ = self.duplex1_write_read_byte_configured(0);
+                    if self.duplex1_write_read_byte_configured(0).is_none() {
+                        self.cs_deassert();
+                        return Err(SpiError::PioTimeout);
+                    }
                 }
             } else {
                 self.dummy_clocks(read_width, dummy_cycles);
@@ -638,10 +655,11 @@ impl<'d> SpiFlash<'d> {
             self.rx_correction_prev = self.read_byte_configured();
             self.rx_bit_correction = true;
         }
+        Ok(())
     }
 
     /// DMA-read one block of data. CS must already be asserted via `start_read()`.
-    pub async fn read_block(&mut self, buf: &mut [u8], io_mode: IoMode) {
+    pub async fn read_block(&mut self, buf: &mut [u8], io_mode: IoMode) -> Result<(), SpiError> {
         let width = io_mode.read_width();
         if self.active_rx_width != width {
             self.configure_rx(width);
@@ -653,13 +671,19 @@ impl<'d> SpiFlash<'d> {
         let mut dma_tx = self.dma_tx.reborrow();
         let rx_transfer = rx.dma_pull(&mut dma_rx, buf, false);
         let tx_transfer = tx.dma_push_zeros::<u32>(&mut dma_tx, len);
-        join(rx_transfer, tx_transfer).await;
+        if with_timeout(DMA_BLOCK_TIMEOUT, join(rx_transfer, tx_transfer))
+            .await
+            .is_err()
+        {
+            return Err(SpiError::PioTimeout);
+        }
 
         if self.rx_bit_correction {
             for byte in buf.iter_mut() {
                 *byte = self.correct_next_rx_byte(*byte);
             }
         }
+        Ok(())
     }
 
     /// Finish a multi-block transfer (deassert CS).
@@ -668,19 +692,27 @@ impl<'d> SpiFlash<'d> {
     }
 
     /// Write one page to flash using standard 1-1-1 page program.
-    pub async fn write_page(
+    pub async fn write_page<F: Fn() -> bool>(
         &mut self,
         opcode: u8,
         address: u32,
         addr_len: u8,
         data: &[u8],
+        cancelled: F,
     ) -> Result<(), SpiError> {
-        self.wait_for_forced_busy_window().await;
+        self.check_forced_busy_window(&cancelled)?;
 
         // ---- Write Enable ----
-        self.cs_assert();
-        let write_enable = self.write_1bit_bytes_duplex(&[config::SPI_CMD_WRITE_ENABLE]);
-        self.cs_deassert();
+        let mut write_enable = false;
+        for _ in 0..2 {
+            self.cs_assert();
+            write_enable = self.write_1bit_bytes_duplex(&[config::SPI_CMD_WRITE_ENABLE]);
+            self.cs_deassert();
+            if write_enable {
+                break;
+            }
+            embassy_time::Timer::after_micros(50).await;
+        }
         if !write_enable {
             return Err(SpiError::PioTimeout);
         }
@@ -694,6 +726,12 @@ impl<'d> SpiFlash<'d> {
             && self.write_1bit_bytes_duplex_configured(data);
         self.cs_deassert();
         if !programmed {
+            // A failed duplex response does not reveal whether the last byte
+            // reached the flash. CS must be released to terminate the command;
+            // wait for any resulting partial program to become idle before the
+            // bus is handed back, while still reporting the operation failed.
+            embassy_time::Timer::after_micros(1_000).await;
+            let _ = self.poll_wip(&cancelled).await;
             return Err(SpiError::PioTimeout);
         }
 
@@ -703,13 +741,16 @@ impl<'d> SpiFlash<'d> {
         // start before polling so the following page's WREN/program sequence is
         // not ignored while the target is still internally busy.
         embassy_time::Timer::after_micros(1_000).await;
-        self.poll_wip().await
+        self.poll_wip(&cancelled).await
     }
 
     /// Poll the flash status register until the WIP (Write In Progress) bit clears.
-    async fn poll_wip(&mut self) -> Result<(), SpiError> {
+    async fn poll_wip<F: Fn() -> bool>(&mut self, cancelled: &F) -> Result<(), SpiError> {
         let deadline = Instant::now() + PAGE_PROGRAM_TIMEOUT;
         loop {
+            if cancelled() {
+                return Err(SpiError::Cancelled);
+            }
             self.cs_assert();
             self.configure_duplex1();
             let status = self
@@ -729,19 +770,18 @@ impl<'d> SpiFlash<'d> {
         }
     }
 
-    async fn wait_for_forced_busy_window(&mut self) {
-        loop {
-            match self.force_busy_until {
-                Some(until) if Instant::now() < until => {
-                    embassy_time::Timer::after_millis(1).await;
-                }
-                Some(_) => {
-                    self.force_busy_until = None;
-                    embassy_time::Timer::after_millis(25).await;
-                    break;
-                }
-                None => break,
+    fn check_forced_busy_window<F: Fn() -> bool>(&mut self, cancelled: &F) -> Result<(), SpiError> {
+        if cancelled() {
+            return Err(SpiError::Cancelled);
+        }
+
+        match self.force_busy_until {
+            Some(until) if Instant::now() < until => Err(SpiError::FlashBusy),
+            Some(_) => {
+                self.force_busy_until = None;
+                Ok(())
             }
+            None => Ok(()),
         }
     }
 }

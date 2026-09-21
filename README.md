@@ -100,6 +100,15 @@ rustup target add thumbv6m-none-eabi
 cargo build --release
 ```
 
+The workspace defaults to the embedded target. Host-only workspace members
+therefore need an explicit host target; plain `cargo test --workspace` or
+`cargo clippy --workspace --all-targets` will try to build them for RP2040.
+
+```bash
+cargo test -p dedipico-protocol --target x86_64-unknown-linux-gnu
+cargo clippy -p dedipicoctl --target x86_64-unknown-linux-gnu -- -D warnings
+```
+
 ## Flashing
 
 ### Install a prebuilt UF2
@@ -162,18 +171,27 @@ kernel drivers do not claim it and stock `flashprog` can still use it:
   - EP0 control — all `CMD_*` vendor requests
   - EP1 OUT (`0x01`) — bulk write data from host
   - EP2 IN (`0x82`) — bulk read data to host
-  - EP15 IN (`0x8f`) — unused reservation for EP2's RP2040 double buffer
+  - EP15 IN (`0x8f`, interrupt) — DPRAM reservation for EP2's double buffer;
+    its non-bulk type prevents flashprog from selecting it as the read endpoint
 - Interface 1: DediPico auxiliary vendor interface
   - EP3 OUT (`0x03`) — host to GPIO/UART
   - EP4 IN (`0x84`) — GPIO/UART to host
 
 Supported commands: `TRANSCEIVE`, `READ`, `WRITE`, `SET_VCC`, `SET_SPI_CLK`,
 `SET_TARGET`, `SET_IO_LED`, `SET_STANDALONE`, `IO_MODE`, `SET_CS`,
-`READ_PROG_INFO`, `READ_EEPROM`, `SET_VOLTAGE` legacy reads, and various stubs
-(`SET_VPP`, `SET_HOLD`, `GET_BUTTON`, `GET_UID`, `READ_FPGA_VERSION`,
+`READ_PROG_INFO`, `READ_EEPROM`, `GET_UID`, `SET_VOLTAGE` legacy reads, and
+various stubs (`SET_VPP`, `SET_HOLD`, `GET_BUTTON`, `READ_FPGA_VERSION`,
 `CHECK_SOCKET`, etc.). The USB serial number, programmer information string,
 and emulated EEPROM serial data are derived from the Pico's onboard flash
-unique ID, so multiple programmers can be distinguished reliably.
+unique ID. The programmer information suffix and flashprog's EEPROM selection
+ID are the same decimal number, so `-p dediprog:id=SF...` matches what the
+device reports.
+
+Bulk setup requests have a capacity-one follow-up queue, allowing flashprog to
+submit its verify read while the final programmed pages are still settling.
+USB packet waits are bounded; an abandoned transfer is cancelled, the flash bus
+is returned to control requests, and the failed bulk endpoint is stalled rather
+than leaving the programmer wedged until it is unplugged.
 
 The auxiliary interface uses variable-length packets of up to 64 bytes. Every
 packet starts with `[type, request_id, payload_len]`. A nonzero request ID asks

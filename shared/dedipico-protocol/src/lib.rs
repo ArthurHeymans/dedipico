@@ -56,13 +56,16 @@ pub mod aux {
 pub mod identity {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     const DEVICE_PREFIX: &[u8] = b"SF600 V:7.2.22 S6B";
+    const PROGRAMMER_ID_LEN: usize = 3;
+    const PROGRAMMER_ID_DECIMAL_LEN: usize = 8;
 
     pub const UNIQUE_ID_LEN: usize = 8;
     pub const USB_SERIAL_LEN: usize = UNIQUE_ID_LEN * 2;
-    pub const DEVICE_STRING_LEN: usize = DEVICE_PREFIX.len() + 6;
+    pub const DEVICE_STRING_LEN: usize = DEVICE_PREFIX.len() + PROGRAMMER_ID_DECIMAL_LEN;
     pub const EEPROM_LEN: usize = 16;
 
     pub struct DeviceIdentity {
+        unique_id: [u8; UNIQUE_ID_LEN],
         usb_serial: [u8; USB_SERIAL_LEN],
         device_string: [u8; DEVICE_STRING_LEN],
         eeprom: [u8; EEPROM_LEN],
@@ -76,17 +79,30 @@ pub mod identity {
                 usb_serial[index * 2 + 1] = HEX[usize::from(byte & 0x0f)];
             }
 
+            let programmer_id_bytes = &unique_id[UNIQUE_ID_LEN - PROGRAMMER_ID_LEN..];
+            let mut programmer_id = u32::from_be_bytes([
+                0,
+                programmer_id_bytes[0],
+                programmer_id_bytes[1],
+                programmer_id_bytes[2],
+            ]);
             let mut device_string = [0; DEVICE_STRING_LEN];
             device_string[..DEVICE_PREFIX.len()].copy_from_slice(DEVICE_PREFIX);
-            for (index, byte) in unique_id[UNIQUE_ID_LEN - 3..].iter().copied().enumerate() {
-                device_string[DEVICE_PREFIX.len() + index * 2] = HEX[usize::from(byte >> 4)];
-                device_string[DEVICE_PREFIX.len() + index * 2 + 1] = HEX[usize::from(byte & 0x0f)];
+            for digit in device_string[DEVICE_PREFIX.len()..].iter_mut().rev() {
+                *digit = b'0' + (programmer_id % 10) as u8;
+                programmer_id /= 10;
             }
 
             let mut eeprom = [0; EEPROM_LEN];
-            eeprom[..UNIQUE_ID_LEN].copy_from_slice(&unique_id);
+            // flashprog interprets the first three EEPROM bytes as a big-endian
+            // integer for `-p dediprog:id=SF...` selection. Keep that value in
+            // sync with the decimal suffix in the programmer information string.
+            eeprom[..PROGRAMMER_ID_LEN].copy_from_slice(programmer_id_bytes);
+            eeprom[PROGRAMMER_ID_LEN..PROGRAMMER_ID_LEN + UNIQUE_ID_LEN]
+                .copy_from_slice(&unique_id);
 
             Self {
+                unique_id,
                 usb_serial,
                 device_string,
                 eeprom,
@@ -96,6 +112,10 @@ pub mod identity {
         pub fn usb_serial(&self) -> &str {
             // Generated exclusively from ASCII hexadecimal digits.
             unsafe { core::str::from_utf8_unchecked(&self.usb_serial) }
+        }
+
+        pub fn unique_id(&self) -> &[u8; UNIQUE_ID_LEN] {
+            &self.unique_id
         }
 
         pub fn device_string(&self) -> &[u8] {
@@ -140,10 +160,23 @@ mod tests {
             DeviceIdentity::from_unique_id([0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe]);
 
         assert_eq!(identity.usb_serial(), "1032547698BADCFE");
-        assert_eq!(identity.device_string(), b"SF600 V:7.2.22 S6BBADCFE");
+        assert_eq!(identity.device_string(), b"SF600 V:7.2.22 S6B12246270");
         assert_eq!(
-            &identity.eeprom()[..8],
+            &identity.eeprom()[..11],
+            &[
+                0xba, 0xdc, 0xfe, 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe
+            ]
+        );
+        assert_eq!(
+            identity.unique_id(),
             &[0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe]
         );
+    }
+
+    #[test]
+    fn pads_programmer_id_as_decimal() {
+        let identity = DeviceIdentity::from_unique_id([0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(identity.device_string(), b"SF600 V:7.2.22 S6B00000001");
+        assert_eq!(&identity.eeprom()[..3], &[0, 0, 1]);
     }
 }

@@ -158,9 +158,11 @@ async fn main(spawner: Spawner) {
     let ep_out = alt.endpoint_bulk_out(Some(ep1_out), USB_MAX_PACKET_SIZE);
     let ep_in = alt.endpoint_bulk_in(Some(ep2_in), USB_MAX_PACKET_SIZE);
     // Embassy does not yet expose RP2040 double-buffer allocation. Reserve the
-    // buffer immediately following EP2 so FastBulkIn can safely use it; the
-    // endpoint is never otherwise accessed.
-    let _ep2_double_buffer_reservation = alt.endpoint_bulk_in(Some(ep15_in), USB_MAX_PACKET_SIZE);
+    // buffer immediately following EP2 so FastBulkIn can safely use it. This is
+    // deliberately an interrupt endpoint: flashprog selects the first bulk IN
+    // endpoint on interface 0 and must never mistake the reservation for EP2.
+    let _ep2_double_buffer_reservation =
+        alt.endpoint_interrupt_in(Some(ep15_in), USB_MAX_PACKET_SIZE, 1);
 
     drop(func); // release borrow on builder
 

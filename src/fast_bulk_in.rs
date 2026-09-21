@@ -1,9 +1,13 @@
-use core::sync::atomic::{Ordering, compiler_fence};
+use core::sync::atomic::compiler_fence;
 
+use defmt::warn;
 use embassy_rp::pac;
 use embassy_usb::driver::EndpointError;
+use portable_atomic::{AtomicBool, Ordering};
 
 use crate::config::{BULK_BLOCK_SIZE, USB_MAX_PACKET_SIZE};
+
+static FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Double-buffered writer for DediProg's fixed bulk-IN endpoint (EP2 IN).
 ///
@@ -35,6 +39,9 @@ impl FastBulkIn {
                 .buffer_address(),
         );
         if reserve_addr != buffer0_addr + Self::BUFFER_STRIDE {
+            if !FALLBACK_WARNED.swap(true, Ordering::Relaxed) {
+                warn!("EP2 double-buffer reservation is not adjacent; using slow bulk IN");
+            }
             return None;
         }
 
@@ -120,5 +127,21 @@ impl FastBulkIn {
             self.write_packet(chunk).await?;
         }
         Ok(())
+    }
+}
+
+impl Drop for FastBulkIn {
+    fn drop(&mut self) {
+        let dpram = pac::USB_DPRAM;
+        dpram.ep_in_control(Self::EP_CONTROL_INDEX).modify(|w| {
+            w.set_interrupt_per_buff(true);
+            w.set_interrupt_per_double_buff(false);
+            w.set_double_buffered(false);
+        });
+        dpram.ep_in_buffer_control(Self::EP_INDEX).write(|w| {
+            w.set_reset(true);
+            w.set_pid(0, true);
+            w.set_pid(1, false);
+        });
     }
 }
