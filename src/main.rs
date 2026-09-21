@@ -608,7 +608,7 @@ async fn bulk_worker_task(
                     Channel::<CriticalSectionRawMutex, [u8; BULK_BLOCK_SIZE]>::new(&mut buf);
                 let (mut sender, mut receiver) = channel.split();
 
-                let (usb_result, ()) = embassy_futures::join::join(
+                let (usb_result, flash_result) = embassy_futures::join::join(
                     // USB producer: receive blocks from host into channel slots
                     async {
                         let mut result: Result<(), embassy_usb::driver::EndpointError> = Ok(());
@@ -628,29 +628,39 @@ async fn bulk_worker_task(
                     },
                     // SPI consumer: program pages from channel slots
                     async {
+                        let mut result = Ok(());
                         for _i in 0..block_count {
                             {
                                 let slot = receiver.receive().await;
-                                // First 256 bytes are real data; rest is padding.
-                                let page_data = &slot[..PAGE_SIZE];
-                                flash.write_page(opcode, address, addr_len, page_data).await;
+                                if result.is_ok() {
+                                    // First 256 bytes are real data; rest is padding.
+                                    let page_data = &slot[..PAGE_SIZE];
+                                    result = flash
+                                        .write_page(opcode, address, addr_len, page_data)
+                                        .await;
+                                }
                             }
                             receiver.receive_done();
                             address = address.wrapping_add(PAGE_SIZE as u32);
                         }
 
-                        // EM100 can acknowledge the last page program command before
-                        // its emulated read array is visible to the immediately
-                        // following flashprog verify pass. Give only the final bulk
-                        // write completion a short settle window instead of slowing
-                        // every page program.
-                        embassy_time::Timer::after_millis(25).await;
+                        if result.is_ok() {
+                            // EM100 can acknowledge the last page program command before
+                            // its emulated read array is visible to the immediately
+                            // following flashprog verify pass. Give only the final bulk
+                            // write completion a short settle window instead of slowing
+                            // every page program.
+                            embassy_time::Timer::after_millis(25).await;
+                        }
+                        result
                     },
                 )
                 .await;
 
-                if usb_result.is_ok() {
-                    info!("Bulk WRITE complete ({} blocks)", block_count);
+                match (usb_result, flash_result) {
+                    (Ok(()), Ok(())) => info!("Bulk WRITE complete ({} blocks)", block_count),
+                    (_, Err(error)) => error!("Bulk WRITE flash error: {}", error),
+                    (Err(_), _) => {}
                 }
             }
         }

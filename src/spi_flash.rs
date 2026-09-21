@@ -31,6 +31,13 @@ type Pio0Program<'d> = LoadedProgram<'d, PIO0>;
 
 const PIO_CYCLES_PER_SCK: u32 = 5;
 const PIO_WAIT_TIMEOUT_ITERS: u32 = 10_000;
+const PAGE_PROGRAM_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, defmt::Format)]
+pub enum SpiError {
+    PioTimeout,
+    FlashBusyTimeout,
+}
 
 struct FlashPioPrograms<'d> {
     duplex1: Pio0Program<'d>,
@@ -660,22 +667,34 @@ impl<'d> SpiFlash<'d> {
     }
 
     /// Write one page to flash using standard 1-1-1 page program.
-    pub async fn write_page(&mut self, opcode: u8, address: u32, addr_len: u8, data: &[u8]) {
+    pub async fn write_page(
+        &mut self,
+        opcode: u8,
+        address: u32,
+        addr_len: u8,
+        data: &[u8],
+    ) -> Result<(), SpiError> {
         self.wait_for_forced_busy_window().await;
 
         // ---- Write Enable ----
         self.cs_assert();
-        let _ = self.write_1bit_bytes_duplex(&[config::SPI_CMD_WRITE_ENABLE]);
+        let write_enable = self.write_1bit_bytes_duplex(&[config::SPI_CMD_WRITE_ENABLE]);
         self.cs_deassert();
+        if !write_enable {
+            return Err(SpiError::PioTimeout);
+        }
         embassy_time::Timer::after_micros(1).await;
 
         // ---- Page Program ----
         self.cs_assert();
         self.configure_duplex1();
-        let _ = self.duplex1_write_read_byte_configured(opcode);
-        let _ = self.write_address_1bit_duplex_configured(address, addr_len);
-        let _ = self.write_1bit_bytes_duplex_configured(data);
+        let programmed = self.duplex1_write_read_byte_configured(opcode).is_some()
+            && self.write_address_1bit_duplex_configured(address, addr_len)
+            && self.write_1bit_bytes_duplex_configured(data);
         self.cs_deassert();
+        if !programmed {
+            return Err(SpiError::PioTimeout);
+        }
 
         // ---- Wait for completion ----
         // Some emulators do not assert WIP quickly enough for an immediate status
@@ -683,20 +702,26 @@ impl<'d> SpiFlash<'d> {
         // start before polling so the following page's WREN/program sequence is
         // not ignored while the target is still internally busy.
         embassy_time::Timer::after_micros(1_000).await;
-        self.poll_wip().await;
+        self.poll_wip().await
     }
 
     /// Poll the flash status register until the WIP (Write In Progress) bit clears.
-    async fn poll_wip(&mut self) {
+    async fn poll_wip(&mut self) -> Result<(), SpiError> {
+        let deadline = Instant::now() + PAGE_PROGRAM_TIMEOUT;
         loop {
             self.cs_assert();
             self.configure_duplex1();
-            let _ = self.duplex1_write_read_byte_configured(config::SPI_CMD_READ_STATUS);
-            let status = self.duplex1_write_read_byte_configured(0).unwrap_or(0xff);
+            let status = self
+                .duplex1_write_read_byte_configured(config::SPI_CMD_READ_STATUS)
+                .and_then(|_| self.duplex1_write_read_byte_configured(0));
             self.cs_deassert();
 
+            let status = status.ok_or(SpiError::PioTimeout)?;
             if status & config::SPI_STATUS_WIP == 0 {
-                break;
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(SpiError::FlashBusyTimeout);
             }
 
             embassy_time::Timer::after_micros(50).await;
