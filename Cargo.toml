@@ -1,5 +1,6 @@
 [workspace]
 members = ["shared/dedipico-protocol", "tools/dedipicoctl"]
+default-members = ["."]
 resolver = "3"
 
 [package]
