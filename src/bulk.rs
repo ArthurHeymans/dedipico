@@ -30,8 +30,19 @@ pub fn install_flash(flash: SpiFlash<'static>) {
     put_flash(flash);
 }
 
-pub fn take_flash() -> Option<SpiFlash<'static>> {
+fn take_flash() -> Option<SpiFlash<'static>> {
     critical_section::with(|cs| SPI_FLASH.borrow(cs).borrow_mut().take())
+}
+
+pub fn take_flash_for_control() -> Option<SpiFlash<'static>> {
+    critical_section::with(|cs| {
+        let state = BULK_STATE.borrow(cs).borrow();
+        if state.active || state.pending.is_some() {
+            None
+        } else {
+            SPI_FLASH.borrow(cs).borrow_mut().take()
+        }
+    })
 }
 
 pub fn put_flash(flash: SpiFlash<'static>) {

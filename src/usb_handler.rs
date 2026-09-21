@@ -7,7 +7,7 @@ use defmt::*;
 use embassy_usb::Handler;
 use embassy_usb::control::{InResponse, OutResponse, Request, RequestType};
 
-use crate::bulk::{put_flash, submit, take_flash};
+use crate::bulk::{put_flash, submit, take_flash_for_control};
 use crate::leds::Leds;
 use crate::protocol::*;
 
@@ -61,7 +61,7 @@ impl DediprogHandler {
             // We don't know the exact read count yet (it comes in the IN phase's
             // wLength), so we read the maximum and trim later.
             let mut read_buf = [0u8; 16];
-            let Some(mut flash) = take_flash() else {
+            let Some(mut flash) = take_flash_for_control() else {
                 warn!("TRANSCEIVE OUT while flash bus is busy");
                 return Some(OutResponse::Rejected);
             };
@@ -71,7 +71,7 @@ impl DediprogHandler {
             self.transceive_read_len = 16;
         } else {
             // Write-only: no read phase coming.
-            let Some(mut flash) = take_flash() else {
+            let Some(mut flash) = take_flash_for_control() else {
                 warn!("TRANSCEIVE OUT while flash bus is busy");
                 return Some(OutResponse::Rejected);
             };
@@ -171,7 +171,7 @@ impl DediprogHandler {
         let speed = SpiSpeed::from_code(req.value);
         let freq = speed.frequency_hz();
         info!("SET_SPI_CLK: {} Hz", freq);
-        let Some(mut flash) = take_flash() else {
+        let Some(mut flash) = take_flash_for_control() else {
             warn!("SET_SPI_CLK while flash bus is busy");
             return Some(OutResponse::Rejected);
         };
@@ -374,7 +374,7 @@ impl Handler for DediprogHandler {
             CMD_SET_CS => {
                 // Manual CS control — assert (wValue=0) or deassert (wValue=1)
                 debug!("SET_CS: wValue={}", req.value);
-                let Some(mut flash) = take_flash() else {
+                let Some(mut flash) = take_flash_for_control() else {
                     warn!("SET_CS while flash bus is busy");
                     return Some(OutResponse::Rejected);
                 };
