@@ -9,7 +9,7 @@ use embassy_usb::control::{InResponse, OutResponse, Request, RequestType};
 
 use crate::leds::Leds;
 use crate::protocol::*;
-use crate::{BULK_OP, BULK_SIGNAL, SPI_FLASH};
+use crate::{put_flash, submit_bulk_operation, take_flash};
 
 pub struct DediprogHandler {
     /// Buffered read data from the last CMD_TRANSCEIVE SPI transaction.
@@ -61,20 +61,22 @@ impl DediprogHandler {
             // We don't know the exact read count yet (it comes in the IN phase's
             // wLength), so we read the maximum and trim later.
             let mut read_buf = [0u8; 16];
-            critical_section::with(|cs| {
-                if let Some(flash) = SPI_FLASH.borrow(cs).borrow_mut().as_mut() {
-                    flash.transceive_blocking(data, &mut read_buf);
-                }
-            });
+            let Some(mut flash) = take_flash() else {
+                warn!("TRANSCEIVE OUT while flash bus is busy");
+                return Some(OutResponse::Rejected);
+            };
+            flash.transceive_blocking(data, &mut read_buf);
+            put_flash(flash);
             self.transceive_read_buf = read_buf;
             self.transceive_read_len = 16;
         } else {
             // Write-only: no read phase coming.
-            critical_section::with(|cs| {
-                if let Some(flash) = SPI_FLASH.borrow(cs).borrow_mut().as_mut() {
-                    flash.write_only_blocking(data);
-                }
-            });
+            let Some(mut flash) = take_flash() else {
+                warn!("TRANSCEIVE OUT while flash bus is busy");
+                return Some(OutResponse::Rejected);
+            };
+            flash.write_only_blocking(data);
+            put_flash(flash);
             self.transceive_read_len = 0;
         }
 
@@ -169,11 +171,12 @@ impl DediprogHandler {
         let speed = SpiSpeed::from_code(req.value);
         let freq = speed.frequency_hz();
         info!("SET_SPI_CLK: {} Hz", freq);
-        critical_section::with(|cs| {
-            if let Some(flash) = SPI_FLASH.borrow(cs).borrow_mut().as_mut() {
-                flash.set_frequency(freq);
-            }
-        });
+        let Some(mut flash) = take_flash() else {
+            warn!("SET_SPI_CLK while flash bus is busy");
+            return Some(OutResponse::Rejected);
+        };
+        flash.set_frequency(freq);
+        put_flash(flash);
         Some(OutResponse::Accepted)
     }
 
@@ -265,12 +268,12 @@ impl DediprogHandler {
             mode_byte,
             dummy_cycles,
         };
-        critical_section::with(|cs| {
-            *BULK_OP.borrow(cs).borrow_mut() = Some(op);
-        });
-        BULK_SIGNAL.signal(());
-
-        Some(OutResponse::Accepted)
+        if submit_bulk_operation(op) {
+            Some(OutResponse::Accepted)
+        } else {
+            warn!("READ setup while another bulk operation is pending");
+            Some(OutResponse::Rejected)
+        }
     }
 
     // =========================================================================
@@ -305,12 +308,12 @@ impl DediprogHandler {
             opcode: actual_opcode,
             addr_len,
         };
-        critical_section::with(|cs| {
-            *BULK_OP.borrow(cs).borrow_mut() = Some(op);
-        });
-        BULK_SIGNAL.signal(());
-
-        Some(OutResponse::Accepted)
+        if submit_bulk_operation(op) {
+            Some(OutResponse::Accepted)
+        } else {
+            warn!("WRITE setup while another bulk operation is pending");
+            Some(OutResponse::Rejected)
+        }
     }
 
     // =========================================================================
@@ -371,15 +374,16 @@ impl Handler for DediprogHandler {
             CMD_SET_CS => {
                 // Manual CS control — assert (wValue=0) or deassert (wValue=1)
                 debug!("SET_CS: wValue={}", req.value);
-                critical_section::with(|cs| {
-                    if let Some(flash) = SPI_FLASH.borrow(cs).borrow_mut().as_mut() {
-                        if req.value == 0 {
-                            flash.cs_assert();
-                        } else {
-                            flash.cs_deassert();
-                        }
-                    }
-                });
+                let Some(mut flash) = take_flash() else {
+                    warn!("SET_CS while flash bus is busy");
+                    return Some(OutResponse::Rejected);
+                };
+                if req.value == 0 {
+                    flash.cs_assert();
+                } else {
+                    flash.cs_deassert();
+                }
+                put_flash(flash);
                 Some(OutResponse::Accepted)
             }
             CMD_SET_HOLD => {

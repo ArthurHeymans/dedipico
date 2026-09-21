@@ -3,13 +3,14 @@
 
 mod aux;
 mod config;
+mod fast_bulk_in;
 mod leds;
 mod protocol;
 mod spi_flash;
 mod usb_handler;
 
 use core::cell::RefCell;
-use core::sync::atomic::{Ordering, compiler_fence};
+use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
 
 use critical_section::Mutex;
 use dedipico_protocol::identity::{DeviceIdentity, UNIQUE_ID_LEN};
@@ -43,6 +44,7 @@ use static_cell::StaticCell;
 
 use crate::aux::*;
 use crate::config::*;
+use crate::fast_bulk_in::FastBulkIn;
 use crate::leds::Leds;
 use crate::protocol::BulkOperation;
 use crate::spi_flash::SpiFlash;
@@ -63,15 +65,61 @@ bind_interrupts!(struct Irqs {
 // Shared state between USB handler (sync) and bulk worker task (async)
 // =============================================================================
 
-/// SPI flash peripheral — borrowed by the handler for transceive (blocking)
-/// and taken by the worker task for bulk operations (async with DMA).
-pub static SPI_FLASH: Mutex<RefCell<Option<SpiFlash<'static>>>> = Mutex::new(RefCell::new(None));
+/// SPI flash peripheral — briefly taken by synchronous control handlers or
+/// held by the worker task for an asynchronous bulk operation.
+static SPI_FLASH: Mutex<RefCell<Option<SpiFlash<'static>>>> = Mutex::new(RefCell::new(None));
 
-/// Pending bulk operation set by the handler, consumed by the worker task.
-pub static BULK_OP: Mutex<RefCell<Option<BulkOperation>>> = Mutex::new(RefCell::new(None));
+struct BulkState {
+    pending: Option<BulkOperation>,
+    active: bool,
+}
+
+static BULK_STATE: Mutex<RefCell<BulkState>> = Mutex::new(RefCell::new(BulkState {
+    pending: None,
+    active: false,
+}));
 
 /// Signal to wake the worker task when a bulk operation is ready.
-pub static BULK_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+static BULK_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+pub fn take_flash() -> Option<SpiFlash<'static>> {
+    critical_section::with(|cs| SPI_FLASH.borrow(cs).borrow_mut().take())
+}
+
+pub fn put_flash(flash: SpiFlash<'static>) {
+    critical_section::with(|cs| {
+        *SPI_FLASH.borrow(cs).borrow_mut() = Some(flash);
+    });
+}
+
+pub fn submit_bulk_operation(operation: BulkOperation) -> bool {
+    let accepted = critical_section::with(|cs| {
+        let mut state = BULK_STATE.borrow(cs).borrow_mut();
+        if state.active || state.pending.is_some() {
+            false
+        } else {
+            state.pending = Some(operation);
+            true
+        }
+    });
+    if accepted {
+        BULK_SIGNAL.signal(());
+    }
+    accepted
+}
+
+fn take_bulk_operation() -> Option<BulkOperation> {
+    critical_section::with(|cs| {
+        let mut state = BULK_STATE.borrow(cs).borrow_mut();
+        let operation = state.pending.take();
+        state.active = operation.is_some();
+        operation
+    })
+}
+
+fn finish_bulk_operation() {
+    critical_section::with(|cs| BULK_STATE.borrow(cs).borrow_mut().active = false);
+}
 
 /// Decouples the PIO UART receiver from USB scheduling. If the host stops
 /// draining the endpoint, new UART bytes are dropped rather than blocking GPIO
@@ -125,19 +173,17 @@ async fn main(spawner: Spawner) {
     cs.set_as_output();
 
     // Store in shared state
-    critical_section::with(|cs_tok| {
-        *SPI_FLASH.borrow(cs_tok).borrow_mut() = Some(SpiFlash::new(
-            pio,
-            DmaChannel::new(p.DMA_CH0, Irqs),
-            DmaChannel::new(p.DMA_CH1, Irqs),
-            p.PIN_3,
-            p.PIN_4,
-            p.PIN_5,
-            p.PIN_6,
-            p.PIN_2,
-            cs,
-        ));
-    });
+    put_flash(SpiFlash::new(
+        pio,
+        DmaChannel::new(p.DMA_CH0, Irqs),
+        DmaChannel::new(p.DMA_CH1, Irqs),
+        p.PIN_3,
+        p.PIN_4,
+        p.PIN_5,
+        p.PIN_6,
+        p.PIN_2,
+        cs,
+    ));
 
     // ---- LEDs ----
     let led_pass = Output::new(p.PIN_25, Level::Low);
@@ -181,6 +227,7 @@ async fn main(spawner: Spawner) {
     // embassy-usb 0.5+ lets us specify exact endpoint addresses.
     let ep1_out = EndpointAddress::from_parts(1, Direction::Out);
     let ep2_in = EndpointAddress::from_parts(2, Direction::In);
+    let ep15_in = EndpointAddress::from_parts(15, Direction::In);
 
     let mut func = builder.function(0xFF, 0x00, 0x00);
     let mut iface = func.interface();
@@ -188,6 +235,10 @@ async fn main(spawner: Spawner) {
 
     let ep_out = alt.endpoint_bulk_out(Some(ep1_out), USB_MAX_PACKET_SIZE);
     let ep_in = alt.endpoint_bulk_in(Some(ep2_in), USB_MAX_PACKET_SIZE);
+    // Embassy does not yet expose RP2040 double-buffer allocation. Reserve the
+    // buffer immediately following EP2 so FastBulkIn can safely use it; the
+    // endpoint is never otherwise accessed.
+    let _ep2_double_buffer_reservation = alt.endpoint_bulk_in(Some(ep15_in), USB_MAX_PACKET_SIZE);
 
     drop(func); // release borrow on builder
 
@@ -510,16 +561,17 @@ async fn bulk_worker_task(
         // Sleep until the USB handler signals a new bulk operation.
         BULK_SIGNAL.wait().await;
 
-        let op = critical_section::with(|cs| BULK_OP.borrow(cs).borrow_mut().take());
+        let op = take_bulk_operation();
 
         let Some(op) = op else {
             continue;
         };
 
         // Take the flash bus out of shared state for exclusive async use.
-        let flash = critical_section::with(|cs| SPI_FLASH.borrow(cs).borrow_mut().take());
+        let flash = take_flash();
         let Some(mut flash) = flash else {
             error!("SPI flash not available for bulk operation");
+            finish_bulk_operation();
             continue;
         };
 
@@ -551,13 +603,16 @@ async fn bulk_worker_task(
                     Channel::<CriticalSectionRawMutex, [u8; BULK_BLOCK_SIZE]>::new(&mut buf);
                 let (mut sender, mut receiver) = channel.split();
                 let mut fast_in = FastBulkIn::new_ep2();
+                let usb_failed = AtomicBool::new(false);
 
                 let ((), usb_result) = embassy_futures::join::join(
                     // SPI producer: DMA-read blocks directly into channel slots
                     async {
                         for _i in 0..block_count {
                             let slot = sender.send().await;
-                            flash.read_block(slot, io_mode).await;
+                            if !usb_failed.load(Ordering::Relaxed) {
+                                flash.read_block(slot, io_mode).await;
+                            }
                             sender.send_done();
                         }
                     },
@@ -567,11 +622,16 @@ async fn bulk_worker_task(
                         for i in 0..block_count {
                             {
                                 let slot = receiver.receive().await;
-                                if result.is_ok()
-                                    && let Err(e) = write_bulk_block(&mut fast_in, slot).await
-                                {
-                                    error!("Bulk IN write error at block {}", i);
-                                    result = Err(e);
+                                if result.is_ok() {
+                                    let write_result = match fast_in.as_mut() {
+                                        Some(fast_in) => fast_in.write_block(slot).await,
+                                        None => write_bulk_block(&mut ep_in, slot).await,
+                                    };
+                                    if let Err(error) = write_result {
+                                        error!("Bulk IN write error at block {}", i);
+                                        usb_failed.store(true, Ordering::Relaxed);
+                                        result = Err(error);
+                                    }
                                 }
                             }
                             receiver.receive_done();
@@ -607,6 +667,7 @@ async fn bulk_worker_task(
                 let mut channel =
                     Channel::<CriticalSectionRawMutex, [u8; BULK_BLOCK_SIZE]>::new(&mut buf);
                 let (mut sender, mut receiver) = channel.split();
+                let usb_failed = AtomicBool::new(false);
 
                 let (usb_result, flash_result) = embassy_futures::join::join(
                     // USB producer: receive blocks from host into channel slots
@@ -619,6 +680,7 @@ async fn bulk_worker_task(
                                     && let Err(e) = read_bulk_block(&mut ep_out, slot).await
                                 {
                                     error!("Bulk OUT read error at block {}", i);
+                                    usb_failed.store(true, Ordering::Relaxed);
                                     result = Err(e);
                                 }
                             }
@@ -632,7 +694,7 @@ async fn bulk_worker_task(
                         for _i in 0..block_count {
                             {
                                 let slot = receiver.receive().await;
-                                if result.is_ok() {
+                                if result.is_ok() && !usb_failed.load(Ordering::Relaxed) {
                                     // First 256 bytes are real data; rest is padding.
                                     let page_data = &slot[..PAGE_SIZE];
                                     result = flash
@@ -666,9 +728,8 @@ async fn bulk_worker_task(
         }
 
         // Return the flash bus to shared state so the handler can use it.
-        critical_section::with(|cs| {
-            *SPI_FLASH.borrow(cs).borrow_mut() = Some(flash);
-        });
+        put_flash(flash);
+        finish_bulk_operation();
     }
 }
 
@@ -676,98 +737,12 @@ async fn bulk_worker_task(
 // Bulk endpoint helpers — read/write 512-byte blocks in max-packet chunks
 // =============================================================================
 
-/// Fast writer for the fixed DediProg bulk-IN endpoint (EP2 IN / 0x82).
-///
-/// Embassy's generic RP2040 USB endpoint driver uses one 64-byte DPRAM buffer per
-/// endpoint. Full-speed bulk can use more bus slots if the device can pre-arm the
-/// next packet while the current one is in flight, so this path enables RP2040's
-/// double-buffered endpoint mode for EP2 IN and alternates both 64-byte buffers.
-/// The protocol endpoint number is not dynamic: flashprog/dediprog always reads
-/// bulk data from EP2 IN, and `main()` allocates EP1 OUT then EP2 IN, giving EP2
-/// buffer 0 the same 0x1c0 DPRAM address Embassy assigned originally.
-struct FastBulkIn {
-    next_buf: usize,
-    next_pid: bool,
-}
-
-impl FastBulkIn {
-    const EP_INDEX: usize = 2;
-    const EP_CONTROL_INDEX: usize = Self::EP_INDEX - 1;
-    const DPRAM_BUFFER0_ADDR: usize = 0x1c0;
-    const BUFFER_STRIDE: usize = USB_MAX_PACKET_SIZE as usize;
-
-    fn new_ep2() -> Self {
-        let dpram = pac::USB_DPRAM;
-        dpram.ep_in_control(Self::EP_CONTROL_INDEX).modify(|w| {
-            w.set_buffer_address(Self::DPRAM_BUFFER0_ADDR as u16);
-            w.set_endpoint_type(pac::usb_dpram::vals::EpControlEndpointType::BULK);
-            w.set_interrupt_per_buff(true);
-            w.set_interrupt_per_double_buff(false);
-            w.set_double_buffered(true);
-            w.set_enable(true);
-        });
-        dpram.ep_in_buffer_control(Self::EP_INDEX).write(|w| {
-            w.set_reset(true);
-            w.set_pid(0, true);
-            w.set_pid(1, false);
-        });
-
-        Self {
-            next_buf: 0,
-            // Matches Embassy's first-packet behavior after endpoint enable: it
-            // stores `pid = !current_pid`, where current_pid starts true.
-            next_pid: false,
-        }
-    }
-
-    async fn write_packet(&mut self, packet: &[u8]) {
-        let dpram = pac::USB_DPRAM;
-        let buf_index = self.next_buf;
-
-        while dpram
-            .ep_in_buffer_control(Self::EP_INDEX)
-            .read()
-            .available(buf_index)
-        {
-            embassy_futures::yield_now().await;
-        }
-
-        compiler_fence(Ordering::SeqCst);
-        let dst = unsafe {
-            core::slice::from_raw_parts_mut(
-                (pac::USB_DPRAM.as_ptr() as *mut u8)
-                    .add(Self::DPRAM_BUFFER0_ADDR + buf_index * Self::BUFFER_STRIDE),
-                packet.len(),
-            )
-        };
-        dst.copy_from_slice(packet);
-        compiler_fence(Ordering::SeqCst);
-
-        dpram.ep_in_buffer_control(Self::EP_INDEX).modify(|w| {
-            w.set_length(buf_index, packet.len() as u16);
-            w.set_pid(buf_index, self.next_pid);
-            w.set_full(buf_index, true);
-        });
-        cortex_m::asm::delay(12);
-        dpram.ep_in_buffer_control(Self::EP_INDEX).modify(|w| {
-            w.set_length(buf_index, packet.len() as u16);
-            w.set_pid(buf_index, self.next_pid);
-            w.set_full(buf_index, true);
-            w.set_available(buf_index, true);
-        });
-
-        self.next_pid = !self.next_pid;
-        self.next_buf ^= 1;
-    }
-}
-
-/// Write a full 512-byte block to the bulk IN endpoint (8 × 64-byte packets).
 async fn write_bulk_block(
-    fast_in: &mut FastBulkIn,
+    ep: &mut <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointIn,
     data: &[u8; BULK_BLOCK_SIZE],
 ) -> Result<(), embassy_usb::driver::EndpointError> {
     for chunk in data.chunks(USB_MAX_PACKET_SIZE as usize) {
-        fast_in.write_packet(chunk).await;
+        ep.write(chunk).await?;
     }
     Ok(())
 }
@@ -780,6 +755,9 @@ async fn read_bulk_block(
     let mut offset = 0;
     while offset < BULK_BLOCK_SIZE {
         let n = ep.read(&mut buf[offset..]).await?;
+        if n == 0 {
+            return Err(embassy_usb::driver::EndpointError::BufferOverflow);
+        }
         offset += n;
     }
     Ok(())
