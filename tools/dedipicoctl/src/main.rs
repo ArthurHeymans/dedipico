@@ -10,7 +10,7 @@ use std::ptr;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
-
+use dedipico_protocol::aux::*;
 use nusb::MaybeFuture;
 use nusb::io::{EndpointRead, EndpointWrite};
 use nusb::transfer::{Bulk, In, Out};
@@ -20,29 +20,13 @@ const PID: u16 = 0xDADA;
 const AUX_IFACE: u8 = 1;
 const EP_OUT: u8 = 0x03;
 const EP_IN: u8 = 0x84;
-const PACKET_LEN: usize = 64;
-const HEADER_LEN: usize = 3;
-const MAX_PAYLOAD_LEN: usize = PACKET_LEN - HEADER_LEN;
 const USB_READ_TIMEOUT: Duration = Duration::from_millis(1);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 
-const CMD_GPIO_GET_STATE: u8 = 0x01;
-const CMD_GPIO_SET_DIRECTION: u8 = 0x02;
-const CMD_GPIO_SET_OUTPUT: u8 = 0x03;
-const CMD_GPIO_PULSE_LOW: u8 = 0x04;
-const CMD_UART_SET_BAUD: u8 = 0x10;
-const CMD_UART_WRITE: u8 = 0x11;
-
-const EVT_RESPONSE: u8 = 0x80;
-const EVT_GPIO_STATE: u8 = 0x81;
-const EVT_UART_DATA: u8 = 0x90;
-const STATUS_OK: u8 = 0;
-const STATUS_BUSY: u8 = 2;
-
-const RESET: u8 = 1 << 0;
-const POWER: u8 = 1 << 1;
-const POWER_STATE: u8 = 1 << 2;
-const AUX: u8 = 1 << 3;
+const RESET: u8 = GPIO_RESET;
+const POWER: u8 = GPIO_POWER;
+const POWER_STATE: u8 = GPIO_POWER_STATE;
+const AUX: u8 = GPIO_AUX;
 
 struct Packet {
     kind: u8,
@@ -138,11 +122,13 @@ impl DediPico {
         }
 
         let mut packet = [0u8; PACKET_LEN];
-        packet[0] = kind;
-        packet[1] = request_id;
-        packet[2] = payload.len() as u8;
-        packet[HEADER_LEN..HEADER_LEN + payload.len()].copy_from_slice(payload);
-        self.tx.write_all(&packet[..HEADER_LEN + payload.len()])?;
+        let packet = encode(&mut packet, kind, request_id, payload).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "auxiliary packet payload is too large",
+            )
+        })?;
+        self.tx.write_all(packet)?;
         self.tx.flush()
     }
 

@@ -1,9 +1,14 @@
+[workspace]
+members = ["shared/dedipico-protocol", "tools/dedipicoctl"]
+resolver = "3"
+
 [package]
 name = "dedipico"
 version = "0.2.0"
 edition = "2024"
 
 [dependencies]
+dedipico-protocol = { path = "shared/dedipico-protocol" }
 embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread"] }
 embassy-rp = { version = "0.10", features = ["rp2040", "time-driver", "critical-section-impl", "unstable-pac"] }
 embassy-usb = "0.6"
