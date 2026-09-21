@@ -12,6 +12,7 @@ use core::cell::RefCell;
 use core::sync::atomic::{Ordering, compiler_fence};
 
 use critical_section::Mutex;
+use dedipico_protocol::identity::{DeviceIdentity, UNIQUE_ID_LEN};
 use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
@@ -19,6 +20,7 @@ use embassy_futures::select::{Either4, select4};
 use embassy_rp::Peri;
 use embassy_rp::bind_interrupts;
 use embassy_rp::dma::{Channel as DmaChannel, InterruptHandler as DmaInterruptHandler};
+use embassy_rp::flash::Blocking;
 use embassy_rp::gpio::{Flex, Input, Level, Output, OutputOpenDrain, Pull};
 use embassy_rp::pac;
 use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIN_0, PIN_1, PIO0, PIO1, USB};
@@ -77,6 +79,7 @@ pub static BULK_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 static UART_RX: SyncChannel<CriticalSectionRawMutex, u8, 256> = SyncChannel::new();
 static UART_TX: SyncChannel<CriticalSectionRawMutex, u8, 256> = SyncChannel::new();
 
+const ONBOARD_FLASH_SIZE: usize = 2 * 1024 * 1024;
 const FLASH_WP_PIN: usize = 5;
 const FLASH_HOLD_PIN: usize = 6;
 const FLASH_CS_PIN: usize = 7;
@@ -97,6 +100,15 @@ async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
     info!("DediPico starting up");
+
+    let mut onboard_flash =
+        embassy_rp::flash::Flash::<_, Blocking, ONBOARD_FLASH_SIZE>::new_blocking(p.FLASH);
+    let mut unique_id = [0; UNIQUE_ID_LEN];
+    if onboard_flash.blocking_unique_id(&mut unique_id).is_err() {
+        warn!("Unable to read onboard flash unique ID");
+    }
+    static IDENTITY: StaticCell<DeviceIdentity> = StaticCell::new();
+    let identity = IDENTITY.init(DeviceIdentity::from_unique_id(unique_id));
 
     // ---- Flash bus ----
     // PIO/multi-I/O-friendly pinout:
@@ -139,7 +151,7 @@ async fn main(spawner: Spawner) {
     let mut usb_config = embassy_usb::Config::new(USB_VID, USB_PID);
     usb_config.manufacturer = Some("DediProg");
     usb_config.product = Some("SF600");
-    usb_config.serial_number = Some("S6B000001");
+    usb_config.serial_number = Some(identity.usb_serial());
     usb_config.max_power = 200;
     usb_config.max_packet_size_0 = 64;
 
@@ -160,7 +172,7 @@ async fn main(spawner: Spawner) {
 
     // ---- Handler ----
     static HANDLER: StaticCell<DediprogHandler> = StaticCell::new();
-    let handler = HANDLER.init(DediprogHandler::new(leds));
+    let handler = HANDLER.init(DediprogHandler::new(leds, identity));
     builder.handler(handler);
 
     // ---- Vendor-class interface with bulk endpoints ----

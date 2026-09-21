@@ -1,3 +1,4 @@
+use dedipico_protocol::identity::DeviceIdentity;
 /// USB control request handler — dispatches all Dediprog vendor commands.
 ///
 /// This implements `embassy_usb::Handler` and is called synchronously from the
@@ -6,7 +7,6 @@ use defmt::*;
 use embassy_usb::Handler;
 use embassy_usb::control::{InResponse, OutResponse, Request, RequestType};
 
-use crate::config;
 use crate::leds::Leds;
 use crate::protocol::*;
 use crate::{BULK_OP, BULK_SIGNAL, SPI_FLASH};
@@ -19,6 +19,8 @@ pub struct DediprogHandler {
     /// LED driver.
     leds: Leds<'static>,
 
+    identity: &'static DeviceIdentity,
+
     /// Current Dediprog multi-I/O mode requested via CMD_IO_MODE.
     current_io_mode: IoMode,
 
@@ -27,11 +29,12 @@ pub struct DediprogHandler {
 }
 
 impl DediprogHandler {
-    pub fn new(leds: Leds<'static>) -> Self {
+    pub fn new(leds: Leds<'static>, identity: &'static DeviceIdentity) -> Self {
         Self {
             transceive_read_buf: [0u8; 16],
             transceive_read_len: 0,
             leds,
+            identity,
             current_io_mode: IoMode::Single,
             configured: false,
         }
@@ -96,7 +99,7 @@ impl DediprogHandler {
     // =========================================================================
 
     fn cmd_read_prog_info<'a>(&self, _req: Request, buf: &'a mut [u8]) -> Option<InResponse<'a>> {
-        let s = config::DEVICE_STRING;
+        let s = self.identity.device_string();
         let len = s.len().min(buf.len());
         buf[..len].copy_from_slice(&s[..len]);
         info!("READ_PROG_INFO: returning device string ({} bytes)", len);
@@ -108,7 +111,7 @@ impl DediprogHandler {
     // =========================================================================
 
     fn cmd_read_eeprom<'a>(&self, _req: Request, buf: &'a mut [u8]) -> Option<InResponse<'a>> {
-        let id = &config::SERIAL_ID;
+        let id = self.identity.eeprom();
         let len = id.len().min(buf.len());
         buf[..len].copy_from_slice(&id[..len]);
         debug!("READ_EEPROM: returning {} bytes", len);
