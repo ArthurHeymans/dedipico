@@ -7,9 +7,9 @@ use defmt::*;
 use embassy_usb::Handler;
 use embassy_usb::control::{InResponse, OutResponse, Request, RequestType};
 
+use crate::bulk::{put_flash, submit, take_flash};
 use crate::leds::Leds;
 use crate::protocol::*;
-use crate::{put_flash, submit_bulk_operation, take_flash};
 
 pub struct DediprogHandler {
     /// Buffered read data from the last CMD_TRANSCEIVE SPI transaction.
@@ -268,7 +268,7 @@ impl DediprogHandler {
             mode_byte,
             dummy_cycles,
         };
-        if submit_bulk_operation(op) {
+        if submit(op) {
             Some(OutResponse::Accepted)
         } else {
             warn!("READ setup while another bulk operation is pending");
@@ -308,7 +308,7 @@ impl DediprogHandler {
             opcode: actual_opcode,
             addr_len,
         };
-        if submit_bulk_operation(op) {
+        if submit(op) {
             Some(OutResponse::Accepted)
         } else {
             warn!("WRITE setup while another bulk operation is pending");

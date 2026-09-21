@@ -23,6 +23,7 @@ use fixed::types::extra::U8;
 
 use crate::config;
 use crate::protocol::IoMode;
+use crate::spi_flash_programs::{assemble_duplex, assemble_rx, assemble_tx};
 
 type Pio0Common<'d> = Common<'d, PIO0>;
 type Pio0Sm0<'d> = StateMachine<'d, PIO0, 0>;
@@ -103,13 +104,13 @@ impl<'d> SpiFlash<'d> {
         io3.set_input_sync_bypass(true);
 
         let programs = FlashPioPrograms {
-            duplex1: pio.common.load_program(&assemble_duplex_program(1)),
-            tx1: pio.common.load_program(&assemble_tx_program(1)),
-            tx2: pio.common.load_program(&assemble_tx_program(2)),
-            tx4: pio.common.load_program(&assemble_tx_program(4)),
-            rx1: pio.common.load_program(&assemble_rx_program(1)),
-            rx2: pio.common.load_program(&assemble_rx_program(2)),
-            rx4: pio.common.load_program(&assemble_rx_program(4)),
+            duplex1: pio.common.load_program(&assemble_duplex(1)),
+            tx1: pio.common.load_program(&assemble_tx(1)),
+            tx2: pio.common.load_program(&assemble_tx(2)),
+            tx4: pio.common.load_program(&assemble_tx(4)),
+            rx1: pio.common.load_program(&assemble_rx(1)),
+            rx2: pio.common.load_program(&assemble_rx(2)),
+            rx4: pio.common.load_program(&assemble_rx(4)),
         };
 
         let mut this = Self {
@@ -743,63 +744,6 @@ impl<'d> SpiFlash<'d> {
             }
         }
     }
-}
-
-fn assemble_duplex_program(width: u8) -> pio::Program<32> {
-    let side_set = pio::SideSet::new(false, 1, false);
-    let mut a = pio::Assembler::<32>::new_with_side_set(side_set);
-    let mut wrap_target = a.label();
-    let mut wrap_source = a.label();
-
-    a.bind(&mut wrap_target);
-    // Five-cycle mode-0 bit cell tuned for 24 MHz. OUT drives MOSI during the
-    // two-cycle low phase; two high-side NOPs delay MISO sampling until late in
-    // the high phase, which avoids the 24 MHz bit-shift seen with earlier cells.
-    a.out_with_delay_and_side_set(pio::OutDestination::PINS, width, 1, 0);
-    a.nop_with_side_set(1);
-    a.nop_with_side_set(1);
-    a.r#in_with_side_set(pio::InSource::PINS, width, 1);
-    a.bind(&mut wrap_source);
-
-    a.assemble_with_wrap(wrap_source, wrap_target)
-}
-
-fn assemble_tx_program(width: u8) -> pio::Program<32> {
-    let groups_per_byte = 8 / width;
-    let side_set = pio::SideSet::new(false, 1, false);
-    let mut a = pio::Assembler::<32>::new_with_side_set(side_set);
-    let mut wrap_target = a.label();
-    let mut wrap_source = a.label();
-    let mut bitloop = a.label();
-
-    a.bind(&mut wrap_target);
-    a.pull_with_side_set(false, true, 0);
-    a.set_with_side_set(pio::SetDestination::X, groups_per_byte - 1, 0);
-    a.bind(&mut bitloop);
-    a.out_with_delay_and_side_set(pio::OutDestination::PINS, width, 1, 0);
-    a.jmp_with_delay_and_side_set(pio::JmpCondition::XDecNonZero, &mut bitloop, 2, 1);
-    a.bind(&mut wrap_source);
-
-    a.assemble_with_wrap(wrap_source, wrap_target)
-}
-
-fn assemble_rx_program(width: u8) -> pio::Program<32> {
-    let side_set = pio::SideSet::new(false, 1, false);
-    let mut a = pio::Assembler::<32>::new_with_side_set(side_set);
-    let mut wrap_target = a.label();
-    let mut wrap_source = a.label();
-
-    a.bind(&mut wrap_target);
-    // Read-only five-cycle bit cell matching the full-duplex sample phase. OUT
-    // NULL consumes one lane-group from OSR so autopull supplies one byte worth
-    // of clocks per TX FIFO word, while IN samples late in the SCK high phase.
-    a.out_with_delay_and_side_set(pio::OutDestination::NULL, width, 1, 0);
-    a.nop_with_side_set(1);
-    a.nop_with_side_set(1);
-    a.r#in_with_side_set(pio::InSource::PINS, width, 1);
-    a.bind(&mut wrap_source);
-
-    a.assemble_with_wrap(wrap_source, wrap_target)
 }
 
 fn erase_busy_duration(write_data: &[u8]) -> Option<Duration> {
