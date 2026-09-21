@@ -1,30 +1,6 @@
+pub use dedipico_protocol::aux::*;
 use embassy_rp::gpio::{Input, OutputOpenDrain};
 use embassy_time::{Duration, Instant};
-
-pub const PACKET_LEN: usize = 64;
-pub const HEADER_LEN: usize = 3;
-pub const MAX_PAYLOAD_LEN: usize = PACKET_LEN - HEADER_LEN;
-
-pub const CMD_GPIO_GET_STATE: u8 = 0x01;
-pub const CMD_GPIO_SET_DIRECTION: u8 = 0x02;
-pub const CMD_GPIO_SET_OUTPUT: u8 = 0x03;
-pub const CMD_GPIO_PULSE_LOW: u8 = 0x04;
-pub const CMD_UART_SET_BAUD: u8 = 0x10;
-pub const CMD_UART_WRITE: u8 = 0x11;
-
-pub const EVT_RESPONSE: u8 = 0x80;
-pub const EVT_GPIO_STATE: u8 = 0x81;
-pub const EVT_UART_DATA: u8 = 0x90;
-
-pub const STATUS_OK: u8 = 0;
-pub const STATUS_INVALID: u8 = 1;
-pub const STATUS_BUSY: u8 = 2;
-
-const GPIO_COUNT: u8 = 4;
-const GPIO_RESET: u8 = 1 << 0;
-const GPIO_POWER: u8 = 1 << 1;
-const CAP_OPEN_DRAIN: u8 = 1 << 0;
-const CAP_PULSE: u8 = 1 << 1;
 
 #[derive(Clone, Copy)]
 struct Pulse {
@@ -135,10 +111,10 @@ impl<'d> BoardGpio<'d> {
             value |= GPIO_POWER;
         }
         if self.power_state.is_high() {
-            value |= 1 << 2;
+            value |= GPIO_POWER_STATE;
         }
         if self.aux_state.is_high() {
-            value |= 1 << 3;
+            value |= GPIO_AUX;
         }
         value
     }

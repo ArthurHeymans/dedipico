@@ -2,47 +2,39 @@
 #![no_main]
 
 mod aux;
+mod aux_usb;
+mod bulk;
 mod config;
+mod fast_bulk_in;
 mod leds;
 mod protocol;
 mod spi_flash;
+mod spi_flash_programs;
 mod usb_handler;
 
-use core::cell::RefCell;
 use core::sync::atomic::{Ordering, compiler_fence};
 
-use critical_section::Mutex;
+use dedipico_protocol::identity::{DeviceIdentity, UNIQUE_ID_LEN};
 use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either4, select4};
 use embassy_rp::Peri;
 use embassy_rp::bind_interrupts;
 use embassy_rp::dma::{Channel as DmaChannel, InterruptHandler as DmaInterruptHandler};
+use embassy_rp::flash::Blocking;
 use embassy_rp::gpio::{Flex, Input, Level, Output, OutputOpenDrain, Pull};
 use embassy_rp::pac;
 use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIN_0, PIN_1, PIO0, PIO1, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
-use embassy_rp::pio_programs::uart::{PioUartRx, PioUartRxProgram, PioUartTx, PioUartTxProgram};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::Channel as SyncChannel;
-use embassy_sync::signal::Signal;
-use embassy_sync::zerocopy_channel::Channel;
-use embassy_time::{Duration, Instant, Timer};
 use embassy_usb::Builder;
-use embassy_usb::driver::{
-    Direction, Endpoint as _, EndpointAddress, EndpointIn as _, EndpointOut as _,
-};
-use fixed::traits::ToFixed;
-use fixed::types::extra::U8;
+use embassy_usb::driver::{Direction, EndpointAddress};
 use panic_probe as _;
 use static_cell::StaticCell;
 
 use crate::aux::*;
 use crate::config::*;
 use crate::leds::Leds;
-use crate::protocol::BulkOperation;
 use crate::spi_flash::SpiFlash;
 use crate::usb_handler::DediprogHandler;
 
@@ -50,33 +42,14 @@ use crate::usb_handler::DediprogHandler;
 // Interrupt bindings
 // =============================================================================
 
-bind_interrupts!(struct Irqs {
+bind_interrupts!(pub(crate) struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
     PIO1_IRQ_0 => PioInterruptHandler<PIO1>;
     DMA_IRQ_0 => DmaInterruptHandler<DMA_CH0>, DmaInterruptHandler<DMA_CH1>;
 });
 
-// =============================================================================
-// Shared state between USB handler (sync) and bulk worker task (async)
-// =============================================================================
-
-/// SPI flash peripheral — borrowed by the handler for transceive (blocking)
-/// and taken by the worker task for bulk operations (async with DMA).
-pub static SPI_FLASH: Mutex<RefCell<Option<SpiFlash<'static>>>> = Mutex::new(RefCell::new(None));
-
-/// Pending bulk operation set by the handler, consumed by the worker task.
-pub static BULK_OP: Mutex<RefCell<Option<BulkOperation>>> = Mutex::new(RefCell::new(None));
-
-/// Signal to wake the worker task when a bulk operation is ready.
-pub static BULK_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
-
-/// Decouples the PIO UART receiver from USB scheduling. If the host stops
-/// draining the endpoint, new UART bytes are dropped rather than blocking GPIO
-/// management indefinitely.
-static UART_RX: SyncChannel<CriticalSectionRawMutex, u8, 256> = SyncChannel::new();
-static UART_TX: SyncChannel<CriticalSectionRawMutex, u8, 256> = SyncChannel::new();
-
+const ONBOARD_FLASH_SIZE: usize = 2 * 1024 * 1024;
 const FLASH_WP_PIN: usize = 5;
 const FLASH_HOLD_PIN: usize = 6;
 const FLASH_CS_PIN: usize = 7;
@@ -86,7 +59,7 @@ const FLASH_IDLE_HIGH_MASK: u32 = (1 << FLASH_WP_PIN) | (1 << FLASH_HOLD_PIN) | 
 // USB device type alias
 // =============================================================================
 
-type UsbDriver = Driver<'static, USB>;
+pub(crate) type UsbDriver = Driver<'static, USB>;
 
 // =============================================================================
 // Entry point
@@ -97,6 +70,15 @@ async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
     info!("DediPico starting up");
+
+    let mut onboard_flash =
+        embassy_rp::flash::Flash::<_, Blocking, ONBOARD_FLASH_SIZE>::new_blocking(p.FLASH);
+    let mut unique_id = [0; UNIQUE_ID_LEN];
+    if onboard_flash.blocking_unique_id(&mut unique_id).is_err() {
+        warn!("Unable to read onboard flash unique ID");
+    }
+    static IDENTITY: StaticCell<DeviceIdentity> = StaticCell::new();
+    let identity = IDENTITY.init(DeviceIdentity::from_unique_id(unique_id));
 
     // ---- Flash bus ----
     // PIO/multi-I/O-friendly pinout:
@@ -113,19 +95,17 @@ async fn main(spawner: Spawner) {
     cs.set_as_output();
 
     // Store in shared state
-    critical_section::with(|cs_tok| {
-        *SPI_FLASH.borrow(cs_tok).borrow_mut() = Some(SpiFlash::new(
-            pio,
-            DmaChannel::new(p.DMA_CH0, Irqs),
-            DmaChannel::new(p.DMA_CH1, Irqs),
-            p.PIN_3,
-            p.PIN_4,
-            p.PIN_5,
-            p.PIN_6,
-            p.PIN_2,
-            cs,
-        ));
-    });
+    bulk::install_flash(SpiFlash::new(
+        pio,
+        DmaChannel::new(p.DMA_CH0, Irqs),
+        DmaChannel::new(p.DMA_CH1, Irqs),
+        p.PIN_3,
+        p.PIN_4,
+        p.PIN_5,
+        p.PIN_6,
+        p.PIN_2,
+        cs,
+    ));
 
     // ---- LEDs ----
     let led_pass = Output::new(p.PIN_25, Level::Low);
@@ -139,7 +119,7 @@ async fn main(spawner: Spawner) {
     let mut usb_config = embassy_usb::Config::new(USB_VID, USB_PID);
     usb_config.manufacturer = Some("DediProg");
     usb_config.product = Some("SF600");
-    usb_config.serial_number = Some("S6B000001");
+    usb_config.serial_number = Some(identity.usb_serial());
     usb_config.max_power = 200;
     usb_config.max_packet_size_0 = 64;
 
@@ -160,7 +140,7 @@ async fn main(spawner: Spawner) {
 
     // ---- Handler ----
     static HANDLER: StaticCell<DediprogHandler> = StaticCell::new();
-    let handler = HANDLER.init(DediprogHandler::new(leds));
+    let handler = HANDLER.init(DediprogHandler::new(leds, identity));
     builder.handler(handler);
 
     // ---- Vendor-class interface with bulk endpoints ----
@@ -169,6 +149,7 @@ async fn main(spawner: Spawner) {
     // embassy-usb 0.5+ lets us specify exact endpoint addresses.
     let ep1_out = EndpointAddress::from_parts(1, Direction::Out);
     let ep2_in = EndpointAddress::from_parts(2, Direction::In);
+    let ep15_in = EndpointAddress::from_parts(15, Direction::In);
 
     let mut func = builder.function(0xFF, 0x00, 0x00);
     let mut iface = func.interface();
@@ -176,6 +157,12 @@ async fn main(spawner: Spawner) {
 
     let ep_out = alt.endpoint_bulk_out(Some(ep1_out), USB_MAX_PACKET_SIZE);
     let ep_in = alt.endpoint_bulk_in(Some(ep2_in), USB_MAX_PACKET_SIZE);
+    // Embassy does not yet expose RP2040 double-buffer allocation. Reserve the
+    // buffer immediately following EP2 so FastBulkIn can safely use it. This is
+    // deliberately an interrupt endpoint: flashprog selects the first bulk IN
+    // endpoint on interface 0 and must never mistake the reservation for EP2.
+    let _ep2_double_buffer_reservation =
+        alt.endpoint_interrupt_in(Some(ep15_in), USB_MAX_PACKET_SIZE, 1);
 
     drop(func); // release borrow on builder
 
@@ -270,495 +257,39 @@ async fn usb_device_task(mut usb: embassy_usb::UsbDevice<'static, UsbDriver>) {
 }
 
 // =============================================================================
-// Auxiliary vendor USB: GPIO + UART bridge
+// Auxiliary vendor USB task
 // =============================================================================
-
-#[embassy_executor::task]
-async fn uart_rx_task(mut uart_rx: PioUartRx<'static, PIO1, 1>) {
-    loop {
-        let byte = uart_rx.read_u8().await;
-        // Management must remain usable even if no host is consuming UART.
-        // The bounded queue makes overload explicit: newest bytes are dropped.
-        let _ = UART_RX.try_send(byte);
-    }
-}
-
-#[embassy_executor::task]
-async fn uart_tx_task(mut uart_tx: PioUartTx<'static, PIO1, 0>) {
-    loop {
-        let byte = UART_TX.receive().await;
-        let _ = embedded_io_async::Write::write_all(&mut uart_tx, &[byte]).await;
-    }
-}
 
 #[embassy_executor::task]
 async fn aux_task(
     spawner: Spawner,
-    mut ep_out: <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointOut,
-    mut ep_in: <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointIn,
+    ep_out: <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointOut,
+    ep_in: <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointIn,
     uart_pio: Peri<'static, PIO1>,
     uart_tx_pin: Peri<'static, PIN_0>,
     uart_rx_pin: Peri<'static, PIN_1>,
-    mut gpio: BoardGpio<'static>,
+    gpio: BoardGpio<'static>,
 ) {
-    let Pio {
-        mut common,
-        sm0,
-        sm1,
-        ..
-    } = Pio::new(uart_pio, Irqs);
-
-    let tx_prog = PioUartTxProgram::new(&mut common);
-    let uart_tx = PioUartTx::new(115_200, &mut common, sm0, uart_tx_pin, &tx_prog);
-
-    let rx_prog = PioUartRxProgram::new(&mut common);
-    let uart_rx = PioUartRx::new(115_200, &mut common, sm1, uart_rx_pin, &rx_prog);
-    spawner.spawn(uart_rx_task(uart_rx).unwrap());
-    spawner.spawn(uart_tx_task(uart_tx).unwrap());
-
-    let mut usb_buf = [0u8; PACKET_LEN];
-    let mut uart_buf = [0u8; MAX_PAYLOAD_LEN];
-    let mut uart_len = 0;
-    let mut uart_deadline = None;
-
-    loop {
-        ep_out.wait_enabled().await;
-        ep_in.wait_enabled().await;
-
-        let flush_at = uart_deadline.unwrap_or(Instant::MAX);
-        let pulse_at = gpio.pulse_deadline().unwrap_or(Instant::MAX);
-
-        match select4(
-            ep_out.read(&mut usb_buf),
-            Timer::at(pulse_at),
-            Timer::at(flush_at),
-            UART_RX.receive(),
-        )
-        .await
-        {
-            Either4::First(Ok(n)) => {
-                handle_aux_packet(&mut ep_in, &mut gpio, &usb_buf[..n]).await;
-            }
-            Either4::First(Err(_)) => {}
-            Either4::Second(()) => {
-                if gpio.finish_pulse_if_due() {
-                    write_packet(&mut ep_in, EVT_GPIO_STATE, 0, &gpio.state()).await;
-                }
-            }
-            Either4::Third(()) => {
-                flush_uart(&mut ep_in, &mut uart_buf, &mut uart_len).await;
-                uart_deadline = None;
-            }
-            Either4::Fourth(byte) => {
-                if uart_len == 0 {
-                    uart_deadline = Some(Instant::now() + Duration::from_millis(1));
-                }
-                uart_buf[uart_len] = byte;
-                uart_len += 1;
-                if uart_len == uart_buf.len() {
-                    flush_uart(&mut ep_in, &mut uart_buf, &mut uart_len).await;
-                    uart_deadline = None;
-                }
-            }
-        }
-    }
-}
-
-async fn flush_uart(
-    ep_in: &mut <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointIn,
-    uart_buf: &mut [u8; MAX_PAYLOAD_LEN],
-    uart_len: &mut usize,
-) {
-    if *uart_len != 0 {
-        write_packet(ep_in, EVT_UART_DATA, 0, &uart_buf[..*uart_len]).await;
-        *uart_len = 0;
-    }
-}
-
-async fn write_packet(
-    ep_in: &mut <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointIn,
-    kind: u8,
-    request_id: u8,
-    payload: &[u8],
-) {
-    let payload = &payload[..payload.len().min(MAX_PAYLOAD_LEN)];
-    let mut packet = [0u8; PACKET_LEN];
-    packet[0] = kind;
-    packet[1] = request_id;
-    packet[2] = payload.len() as u8;
-    packet[HEADER_LEN..HEADER_LEN + payload.len()].copy_from_slice(payload);
-    let _ = ep_in.write(&packet[..HEADER_LEN + payload.len()]).await;
-}
-
-async fn write_response(
-    ep_in: &mut <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointIn,
-    request_id: u8,
-    command: u8,
-    status: u8,
-    data: &[u8],
-) {
-    let data = &data[..data.len().min(MAX_PAYLOAD_LEN - 2)];
-    let mut payload = [0u8; MAX_PAYLOAD_LEN];
-    payload[0] = command;
-    payload[1] = status;
-    payload[2..2 + data.len()].copy_from_slice(data);
-    write_packet(ep_in, EVT_RESPONSE, request_id, &payload[..2 + data.len()]).await;
-}
-
-async fn handle_aux_packet(
-    ep_in: &mut <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointIn,
-    gpio: &mut BoardGpio<'static>,
-    packet: &[u8],
-) {
-    if packet.len() < HEADER_LEN {
-        return;
-    }
-
-    let command = packet[0];
-    let request_id = packet[1];
-    let payload_len = (packet[2] as usize).min(packet.len() - HEADER_LEN);
-    let payload = &packet[HEADER_LEN..HEADER_LEN + payload_len];
-
-    let status = match command {
-        CMD_GPIO_GET_STATE if payload.is_empty() => STATUS_OK,
-        CMD_GPIO_SET_DIRECTION if payload.len() == 2 => {
-            gpio.set_direction(payload[0], payload[1]);
-            STATUS_OK
-        }
-        CMD_GPIO_SET_OUTPUT if payload.len() == 2 => {
-            gpio.set_output(payload[0], payload[1]);
-            STATUS_OK
-        }
-        CMD_GPIO_PULSE_LOW if payload.len() == 3 => {
-            gpio.start_pulse_low(payload[0], u16::from_le_bytes([payload[1], payload[2]]));
-            STATUS_OK
-        }
-        CMD_UART_SET_BAUD if payload.len() == 4 => {
-            set_pio1_uart_baudrate(u32::from_le_bytes([
-                payload[0], payload[1], payload[2], payload[3],
-            ]));
-            STATUS_OK
-        }
-        CMD_UART_WRITE if UART_TX.free_capacity() >= payload.len() => {
-            for &byte in payload {
-                let _ = UART_TX.try_send(byte);
-            }
-            STATUS_OK
-        }
-        CMD_UART_WRITE => STATUS_BUSY,
-        _ => STATUS_INVALID,
-    };
-
-    if request_id != 0 {
-        let state = match command {
-            CMD_GPIO_GET_STATE
-            | CMD_GPIO_SET_DIRECTION
-            | CMD_GPIO_SET_OUTPUT
-            | CMD_GPIO_PULSE_LOW
-                if status == STATUS_OK =>
-            {
-                Some(gpio.state())
-            }
-            _ => None,
-        };
-        write_response(
-            ep_in,
-            request_id,
-            command,
-            status,
-            state.as_ref().map_or(&[], |state| state.as_slice()),
-        )
-        .await;
-    }
-}
-
-fn set_pio1_uart_baudrate(baudrate: u32) {
-    let baudrate = baudrate.clamp(300, 3_000_000);
-    let divider =
-        (embassy_rp::clocks::clk_sys_freq() / (8 * baudrate)).to_fixed::<fixed::FixedU32<U8>>();
-
-    for sm in 0..=1 {
-        pac::PIO1
-            .sm(sm)
-            .clkdiv()
-            .write(|w| w.0 = divider.to_bits() << 8);
-    }
+    aux_usb::run(
+        spawner,
+        ep_out,
+        ep_in,
+        uart_pio,
+        uart_tx_pin,
+        uart_rx_pin,
+        gpio,
+    )
+    .await;
 }
 
 // =============================================================================
-// Bulk worker task — handles bulk read/write operations using the PIO flash bus
+// Bulk worker task
 // =============================================================================
 
 #[embassy_executor::task]
 async fn bulk_worker_task(
-    mut ep_in: <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointIn,
-    mut ep_out: <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointOut,
+    ep_in: <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointIn,
+    ep_out: <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointOut,
 ) {
-    loop {
-        // Sleep until the USB handler signals a new bulk operation.
-        BULK_SIGNAL.wait().await;
-
-        let op = critical_section::with(|cs| BULK_OP.borrow(cs).borrow_mut().take());
-
-        let Some(op) = op else {
-            continue;
-        };
-
-        // Take the flash bus out of shared state for exclusive async use.
-        let flash = critical_section::with(|cs| SPI_FLASH.borrow(cs).borrow_mut().take());
-        let Some(mut flash) = flash else {
-            error!("SPI flash not available for bulk operation");
-            continue;
-        };
-
-        match op {
-            BulkOperation::Read {
-                address,
-                block_count,
-                opcode,
-                addr_len,
-                dummy_cycles,
-                io_mode,
-                mode_byte,
-            } => {
-                info!(
-                    "Bulk READ: addr=0x{:08x} blocks={} opcode=0x{:02x} io_mode={} dummy_cycles={}",
-                    address, block_count, opcode, io_mode, dummy_cycles
-                );
-
-                ep_in.wait_enabled().await;
-                flash
-                    .start_read(opcode, address, addr_len, io_mode, mode_byte, dummy_cycles)
-                    .await;
-
-                // Zero-copy double buffer: 2 slots of 512 bytes.
-                // The channel handles synchronization so SPI fills one slot
-                // while USB drains the other — no mem::swap needed.
-                let mut buf = [[0u8; BULK_BLOCK_SIZE]; 2];
-                let mut channel =
-                    Channel::<CriticalSectionRawMutex, [u8; BULK_BLOCK_SIZE]>::new(&mut buf);
-                let (mut sender, mut receiver) = channel.split();
-                let mut fast_in = FastBulkIn::new_ep2();
-
-                let ((), usb_result) = embassy_futures::join::join(
-                    // SPI producer: DMA-read blocks directly into channel slots
-                    async {
-                        for _i in 0..block_count {
-                            let slot = sender.send().await;
-                            flash.read_block(slot, io_mode).await;
-                            sender.send_done();
-                        }
-                    },
-                    // USB consumer: send filled slots to the host
-                    async {
-                        let mut result: Result<(), embassy_usb::driver::EndpointError> = Ok(());
-                        for i in 0..block_count {
-                            {
-                                let slot = receiver.receive().await;
-                                if result.is_ok()
-                                    && let Err(e) = write_bulk_block(&mut fast_in, slot).await
-                                {
-                                    error!("Bulk IN write error at block {}", i);
-                                    result = Err(e);
-                                }
-                            }
-                            receiver.receive_done();
-                        }
-                        result
-                    },
-                )
-                .await;
-
-                flash.end_transfer();
-
-                if usb_result.is_ok() {
-                    info!("Bulk READ complete ({} blocks)", block_count);
-                }
-            }
-
-            BulkOperation::Write {
-                mut address,
-                block_count,
-                opcode,
-                addr_len,
-            } => {
-                info!(
-                    "Bulk WRITE: addr=0x{:08x} blocks={} opcode=0x{:02x}",
-                    address, block_count, opcode
-                );
-
-                ep_out.wait_enabled().await;
-
-                // Zero-copy double buffer: USB receives into one slot
-                // while SPI programs from the other.
-                let mut buf = [[0u8; BULK_BLOCK_SIZE]; 2];
-                let mut channel =
-                    Channel::<CriticalSectionRawMutex, [u8; BULK_BLOCK_SIZE]>::new(&mut buf);
-                let (mut sender, mut receiver) = channel.split();
-
-                let (usb_result, ()) = embassy_futures::join::join(
-                    // USB producer: receive blocks from host into channel slots
-                    async {
-                        let mut result: Result<(), embassy_usb::driver::EndpointError> = Ok(());
-                        for i in 0..block_count {
-                            {
-                                let slot = sender.send().await;
-                                if result.is_ok()
-                                    && let Err(e) = read_bulk_block(&mut ep_out, slot).await
-                                {
-                                    error!("Bulk OUT read error at block {}", i);
-                                    result = Err(e);
-                                }
-                            }
-                            sender.send_done();
-                        }
-                        result
-                    },
-                    // SPI consumer: program pages from channel slots
-                    async {
-                        for _i in 0..block_count {
-                            {
-                                let slot = receiver.receive().await;
-                                // First 256 bytes are real data; rest is padding.
-                                let page_data = &slot[..PAGE_SIZE];
-                                flash.write_page(opcode, address, addr_len, page_data).await;
-                            }
-                            receiver.receive_done();
-                            address = address.wrapping_add(PAGE_SIZE as u32);
-                        }
-
-                        // EM100 can acknowledge the last page program command before
-                        // its emulated read array is visible to the immediately
-                        // following flashprog verify pass. Give only the final bulk
-                        // write completion a short settle window instead of slowing
-                        // every page program.
-                        embassy_time::Timer::after_millis(25).await;
-                    },
-                )
-                .await;
-
-                if usb_result.is_ok() {
-                    info!("Bulk WRITE complete ({} blocks)", block_count);
-                }
-            }
-        }
-
-        // Return the flash bus to shared state so the handler can use it.
-        critical_section::with(|cs| {
-            *SPI_FLASH.borrow(cs).borrow_mut() = Some(flash);
-        });
-    }
-}
-
-// =============================================================================
-// Bulk endpoint helpers — read/write 512-byte blocks in max-packet chunks
-// =============================================================================
-
-/// Fast writer for the fixed DediProg bulk-IN endpoint (EP2 IN / 0x82).
-///
-/// Embassy's generic RP2040 USB endpoint driver uses one 64-byte DPRAM buffer per
-/// endpoint. Full-speed bulk can use more bus slots if the device can pre-arm the
-/// next packet while the current one is in flight, so this path enables RP2040's
-/// double-buffered endpoint mode for EP2 IN and alternates both 64-byte buffers.
-/// The protocol endpoint number is not dynamic: flashprog/dediprog always reads
-/// bulk data from EP2 IN, and `main()` allocates EP1 OUT then EP2 IN, giving EP2
-/// buffer 0 the same 0x1c0 DPRAM address Embassy assigned originally.
-struct FastBulkIn {
-    next_buf: usize,
-    next_pid: bool,
-}
-
-impl FastBulkIn {
-    const EP_INDEX: usize = 2;
-    const EP_CONTROL_INDEX: usize = Self::EP_INDEX - 1;
-    const DPRAM_BUFFER0_ADDR: usize = 0x1c0;
-    const BUFFER_STRIDE: usize = USB_MAX_PACKET_SIZE as usize;
-
-    fn new_ep2() -> Self {
-        let dpram = pac::USB_DPRAM;
-        dpram.ep_in_control(Self::EP_CONTROL_INDEX).modify(|w| {
-            w.set_buffer_address(Self::DPRAM_BUFFER0_ADDR as u16);
-            w.set_endpoint_type(pac::usb_dpram::vals::EpControlEndpointType::BULK);
-            w.set_interrupt_per_buff(true);
-            w.set_interrupt_per_double_buff(false);
-            w.set_double_buffered(true);
-            w.set_enable(true);
-        });
-        dpram.ep_in_buffer_control(Self::EP_INDEX).write(|w| {
-            w.set_reset(true);
-            w.set_pid(0, true);
-            w.set_pid(1, false);
-        });
-
-        Self {
-            next_buf: 0,
-            // Matches Embassy's first-packet behavior after endpoint enable: it
-            // stores `pid = !current_pid`, where current_pid starts true.
-            next_pid: false,
-        }
-    }
-
-    async fn write_packet(&mut self, packet: &[u8]) {
-        let dpram = pac::USB_DPRAM;
-        let buf_index = self.next_buf;
-
-        while dpram
-            .ep_in_buffer_control(Self::EP_INDEX)
-            .read()
-            .available(buf_index)
-        {
-            embassy_futures::yield_now().await;
-        }
-
-        compiler_fence(Ordering::SeqCst);
-        let dst = unsafe {
-            core::slice::from_raw_parts_mut(
-                (pac::USB_DPRAM.as_ptr() as *mut u8)
-                    .add(Self::DPRAM_BUFFER0_ADDR + buf_index * Self::BUFFER_STRIDE),
-                packet.len(),
-            )
-        };
-        dst.copy_from_slice(packet);
-        compiler_fence(Ordering::SeqCst);
-
-        dpram.ep_in_buffer_control(Self::EP_INDEX).modify(|w| {
-            w.set_length(buf_index, packet.len() as u16);
-            w.set_pid(buf_index, self.next_pid);
-            w.set_full(buf_index, true);
-        });
-        cortex_m::asm::delay(12);
-        dpram.ep_in_buffer_control(Self::EP_INDEX).modify(|w| {
-            w.set_length(buf_index, packet.len() as u16);
-            w.set_pid(buf_index, self.next_pid);
-            w.set_full(buf_index, true);
-            w.set_available(buf_index, true);
-        });
-
-        self.next_pid = !self.next_pid;
-        self.next_buf ^= 1;
-    }
-}
-
-/// Write a full 512-byte block to the bulk IN endpoint (8 × 64-byte packets).
-async fn write_bulk_block(
-    fast_in: &mut FastBulkIn,
-    data: &[u8; BULK_BLOCK_SIZE],
-) -> Result<(), embassy_usb::driver::EndpointError> {
-    for chunk in data.chunks(USB_MAX_PACKET_SIZE as usize) {
-        fast_in.write_packet(chunk).await;
-    }
-    Ok(())
-}
-
-/// Read a full 512-byte block from the bulk OUT endpoint.
-async fn read_bulk_block(
-    ep: &mut <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointOut,
-    buf: &mut [u8; BULK_BLOCK_SIZE],
-) -> Result<(), embassy_usb::driver::EndpointError> {
-    let mut offset = 0;
-    while offset < BULK_BLOCK_SIZE {
-        let n = ep.read(&mut buf[offset..]).await?;
-        offset += n;
-    }
-    Ok(())
+    bulk::run(ep_in, ep_out).await;
 }

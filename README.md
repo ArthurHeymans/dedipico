@@ -82,17 +82,31 @@ POWER_SW# low for about 5 s to request power-off on ATX-style boards.
            to host PC
 ```
 
-The Pico supplies 3.3 V directly. No level shifter is needed for 3.3 V flash
-chips. For 1.8 V parts, add an external level shifter. For quad I/O, make sure
-IO2/WP# and IO3/HOLD# are wired. When idle, the firmware releases SCK,
-IO0-IO3, and CS# to input/Hi-Z so an in-system mainboard SPI controller can
-own the bus.
+The wiring above powers a loose 3.3 V flash chip directly from the Pico. For
+in-system programming, do not connect the Pico's 3V3 pin when the target board
+already powers the flash: tying two supplies together can damage either board.
+Always share ground, verify the target I/O voltage, and ensure the target CPU is
+not driving the SPI bus while DediPico is active. A 1.8 V part requires an
+external level shifter and a suitable 1.8 V supply.
+
+When idle, the firmware releases SCK, IO0-IO3, and CS# to input/Hi-Z so an
+in-system mainboard SPI controller can own the bus. This is a convenience for
+carefully controlled setups, not electrical isolation or contention protection.
 
 ## Building
 
 ```bash
 rustup target add thumbv6m-none-eabi
 cargo build --release
+```
+
+The workspace defaults to the embedded target. Host-only workspace members
+therefore need an explicit host target; plain `cargo test --workspace` or
+`cargo clippy --workspace --all-targets` will try to build them for RP2040.
+
+```bash
+cargo test -p dedipico-protocol --target x86_64-unknown-linux-gnu
+cargo clippy -p dedipicoctl --target x86_64-unknown-linux-gnu -- -D warnings
 ```
 
 ## Flashing
@@ -157,15 +171,27 @@ kernel drivers do not claim it and stock `flashprog` can still use it:
   - EP0 control — all `CMD_*` vendor requests
   - EP1 OUT (`0x01`) — bulk write data from host
   - EP2 IN (`0x82`) — bulk read data to host
+  - EP15 IN (`0x8f`, interrupt) — DPRAM reservation for EP2's double buffer;
+    its non-bulk type prevents flashprog from selecting it as the read endpoint
 - Interface 1: DediPico auxiliary vendor interface
   - EP3 OUT (`0x03`) — host to GPIO/UART
   - EP4 IN (`0x84`) — GPIO/UART to host
 
 Supported commands: `TRANSCEIVE`, `READ`, `WRITE`, `SET_VCC`, `SET_SPI_CLK`,
 `SET_TARGET`, `SET_IO_LED`, `SET_STANDALONE`, `IO_MODE`, `SET_CS`,
-`READ_PROG_INFO`, `READ_EEPROM`, `SET_VOLTAGE` legacy reads, and various stubs
-(`SET_VPP`, `SET_HOLD`, `GET_BUTTON`, `GET_UID`, `READ_FPGA_VERSION`,
-`CHECK_SOCKET`, etc.).
+`READ_PROG_INFO`, `READ_EEPROM`, `GET_UID`, `SET_VOLTAGE` legacy reads, and
+various stubs (`SET_VPP`, `SET_HOLD`, `GET_BUTTON`, `READ_FPGA_VERSION`,
+`CHECK_SOCKET`, etc.). The USB serial number, programmer information string,
+and emulated EEPROM serial data are derived from the Pico's onboard flash
+unique ID. The programmer information suffix and flashprog's EEPROM selection
+ID are the same decimal number, so `-p dediprog:id=SF...` matches what the
+device reports.
+
+Bulk setup requests have a capacity-one follow-up queue, allowing flashprog to
+submit its verify read while the final programmed pages are still settling.
+USB packet waits are bounded; an abandoned transfer is cancelled, the flash bus
+is returned to control requests, and the failed bulk endpoint is stalled rather
+than leaving the programmer wedged until it is unplugged.
 
 The auxiliary interface uses variable-length packets of up to 64 bytes. Every
 packet starts with `[type, request_id, payload_len]`. A nonzero request ID asks
@@ -234,20 +260,28 @@ they can remain active at the same time.
 - **SPI clock speed switching is supported by the PIO clock divider.** The bus
   defaults to 24 MHz, caps requested speeds at 24 MHz, and is reconfigured at
   runtime when flashprog sends `SET_SPI_CLK` (e.g. `spispeed=12M`).
-- **No voltage switching.** The Pico's 3V3 rail is always on. `SET_VCC` is
-  acknowledged but does not control power.
+- **No voltage switching or isolation.** `SET_VCC` is acknowledged for protocol
+  compatibility but does not control the Pico's 3V3 pin. Use external switching
+  or leave 3V3 disconnected when the target supplies its own flash rail.
 
 ## Project structure
 
 ```text
 src/
-├── main.rs           Entry point, USB + flash-bus init, bulk/aux worker tasks
-├── usb_handler.rs    embassy_usb::Handler — dispatches CMD_* control transfers
-├── protocol.rs       Command codes, enums, V2/V3 packet parsing
-├── spi_flash.rs      All-PIO + DMA flash ops (single writes; single/dual/quad reads)
-├── aux.rs            Vendor GPIO/UART auxiliary protocol
-├── leds.rs           GPIO LED driver
-└── config.rs         Device identity, constants
+├── main.rs                 Entry point and peripheral/USB construction
+├── bulk.rs                 Bulk-operation state machine and transfer workers
+├── aux_usb.rs              Auxiliary USB/UART worker
+├── usb_handler.rs          DediProg control-transfer dispatch
+├── protocol.rs             DediProg V2/V3 command parsing
+├── spi_flash.rs            PIO + DMA flash driver
+├── spi_flash_programs.rs   PIO instruction assembly
+├── fast_bulk_in.rs         RP2040 double-buffered EP2 fast path
+├── aux.rs                  Board GPIO state and pulse control
+├── leds.rs                 GPIO LED driver
+└── config.rs               Hardware and transfer constants
+
+shared/dedipico-protocol/   Shared no-std auxiliary protocol and device identity
+tools/dedipicoctl/          Host UART/control daemon and CLI
 ```
 
 ## License

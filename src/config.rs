@@ -1,18 +1,6 @@
 // Device identity and hardware constants.
 
 // =============================================================================
-// Device identity (emulating SF600 with firmware 7.2.22, Protocol V3)
-// =============================================================================
-
-/// Response to CMD_READ_PROG_INFO (0x08).
-/// Format: "SF600 V:7.2.22 S6B000001"
-pub const DEVICE_STRING: &[u8] = b"SF600 V:7.2.22 S6B000001";
-
-/// Response to CMD_READ_EEPROM (0x05): 16-byte serial ID.
-/// Decoded as buf[0]<<16 | buf[1]<<8 | buf[2].
-pub const SERIAL_ID: [u8; 16] = [0x01, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-
-// =============================================================================
 // USB descriptors
 // =============================================================================
 

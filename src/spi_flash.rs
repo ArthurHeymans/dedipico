@@ -16,13 +16,14 @@ use embassy_rp::pio::{
     Common, Config, Direction, FifoJoin, LoadedProgram, Pin, Pio, PioPin, ShiftConfig,
     ShiftDirection, StateMachine,
 };
-use embassy_time::{Duration, Instant};
+use embassy_time::{Duration, Instant, with_timeout};
 use fixed::traits::ToFixed;
 use fixed::types::U24F8;
 use fixed::types::extra::U8;
 
 use crate::config;
 use crate::protocol::IoMode;
+use crate::spi_flash_programs::{assemble_duplex, assemble_rx, assemble_tx};
 
 type Pio0Common<'d> = Common<'d, PIO0>;
 type Pio0Sm0<'d> = StateMachine<'d, PIO0, 0>;
@@ -31,6 +32,16 @@ type Pio0Program<'d> = LoadedProgram<'d, PIO0>;
 
 const PIO_CYCLES_PER_SCK: u32 = 5;
 const PIO_WAIT_TIMEOUT_ITERS: u32 = 10_000;
+const PAGE_PROGRAM_TIMEOUT: Duration = Duration::from_millis(250);
+const DMA_BLOCK_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy, Debug, defmt::Format)]
+pub enum SpiError {
+    PioTimeout,
+    FlashBusy,
+    FlashBusyTimeout,
+    Cancelled,
+}
 
 struct FlashPioPrograms<'d> {
     duplex1: Pio0Program<'d>,
@@ -96,13 +107,13 @@ impl<'d> SpiFlash<'d> {
         io3.set_input_sync_bypass(true);
 
         let programs = FlashPioPrograms {
-            duplex1: pio.common.load_program(&assemble_duplex_program(1)),
-            tx1: pio.common.load_program(&assemble_tx_program(1)),
-            tx2: pio.common.load_program(&assemble_tx_program(2)),
-            tx4: pio.common.load_program(&assemble_tx_program(4)),
-            rx1: pio.common.load_program(&assemble_rx_program(1)),
-            rx2: pio.common.load_program(&assemble_rx_program(2)),
-            rx4: pio.common.load_program(&assemble_rx_program(4)),
+            duplex1: pio.common.load_program(&assemble_duplex(1)),
+            tx1: pio.common.load_program(&assemble_tx(1)),
+            tx2: pio.common.load_program(&assemble_tx(2)),
+            tx4: pio.common.load_program(&assemble_tx(4)),
+            rx1: pio.common.load_program(&assemble_rx(1)),
+            rx2: pio.common.load_program(&assemble_rx(2)),
+            rx4: pio.common.load_program(&assemble_rx(4)),
         };
 
         let mut this = Self {
@@ -566,7 +577,8 @@ impl<'d> SpiFlash<'d> {
 
     /// Begin a read sequence. Opcode is 1-bit unless QPI is requested.
     /// Address/mode/data phases follow the current Dediprog I/O mode.
-    pub async fn start_read(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_read<F: Fn() -> bool>(
         &mut self,
         opcode: u8,
         address: u32,
@@ -574,8 +586,9 @@ impl<'d> SpiFlash<'d> {
         io_mode: IoMode,
         mode_byte: Option<u8>,
         dummy_cycles: u8,
-    ) {
-        self.wait_for_forced_busy_window().await;
+        cancelled: F,
+    ) -> Result<(), SpiError> {
+        self.check_forced_busy_window(&cancelled)?;
 
         self.cs_assert();
 
@@ -585,7 +598,10 @@ impl<'d> SpiFlash<'d> {
 
         if opcode_width == 1 {
             self.configure_duplex1();
-            let _ = self.duplex1_write_read_byte_configured(opcode);
+            if self.duplex1_write_read_byte_configured(opcode).is_none() {
+                self.cs_deassert();
+                return Err(SpiError::PioTimeout);
+            }
         } else {
             self.write_byte_width(opcode, opcode_width);
         }
@@ -596,15 +612,24 @@ impl<'d> SpiFlash<'d> {
             // reconfigured for a multi-lane address/read phase; EM100 traces saw
             // 0xbb degraded to 0xba in that case.
             self.configure_duplex1();
-            let _ = self.write_address_1bit_duplex_configured(address, addr_len);
-            if let Some(mode) = mode_byte {
-                let _ = self.duplex1_write_read_byte_configured(mode);
+            if !self.write_address_1bit_duplex_configured(address, addr_len) {
+                self.cs_deassert();
+                return Err(SpiError::PioTimeout);
+            }
+            if let Some(mode) = mode_byte
+                && self.duplex1_write_read_byte_configured(mode).is_none()
+            {
+                self.cs_deassert();
+                return Err(SpiError::PioTimeout);
             }
             if dummy_cycles > 0 && read_width == 1 {
                 let cycles_per_byte = 8 / read_width;
                 let bytes = dummy_cycles.div_ceil(cycles_per_byte);
                 for _ in 0..bytes {
-                    let _ = self.duplex1_write_read_byte_configured(0);
+                    if self.duplex1_write_read_byte_configured(0).is_none() {
+                        self.cs_deassert();
+                        return Err(SpiError::PioTimeout);
+                    }
                 }
             } else {
                 self.dummy_clocks(read_width, dummy_cycles);
@@ -630,10 +655,11 @@ impl<'d> SpiFlash<'d> {
             self.rx_correction_prev = self.read_byte_configured();
             self.rx_bit_correction = true;
         }
+        Ok(())
     }
 
     /// DMA-read one block of data. CS must already be asserted via `start_read()`.
-    pub async fn read_block(&mut self, buf: &mut [u8], io_mode: IoMode) {
+    pub async fn read_block(&mut self, buf: &mut [u8], io_mode: IoMode) -> Result<(), SpiError> {
         let width = io_mode.read_width();
         if self.active_rx_width != width {
             self.configure_rx(width);
@@ -645,13 +671,19 @@ impl<'d> SpiFlash<'d> {
         let mut dma_tx = self.dma_tx.reborrow();
         let rx_transfer = rx.dma_pull(&mut dma_rx, buf, false);
         let tx_transfer = tx.dma_push_zeros::<u32>(&mut dma_tx, len);
-        join(rx_transfer, tx_transfer).await;
+        if with_timeout(DMA_BLOCK_TIMEOUT, join(rx_transfer, tx_transfer))
+            .await
+            .is_err()
+        {
+            return Err(SpiError::PioTimeout);
+        }
 
         if self.rx_bit_correction {
             for byte in buf.iter_mut() {
                 *byte = self.correct_next_rx_byte(*byte);
             }
         }
+        Ok(())
     }
 
     /// Finish a multi-block transfer (deassert CS).
@@ -660,22 +692,48 @@ impl<'d> SpiFlash<'d> {
     }
 
     /// Write one page to flash using standard 1-1-1 page program.
-    pub async fn write_page(&mut self, opcode: u8, address: u32, addr_len: u8, data: &[u8]) {
-        self.wait_for_forced_busy_window().await;
+    pub async fn write_page<F: Fn() -> bool>(
+        &mut self,
+        opcode: u8,
+        address: u32,
+        addr_len: u8,
+        data: &[u8],
+        cancelled: F,
+    ) -> Result<(), SpiError> {
+        self.check_forced_busy_window(&cancelled)?;
 
         // ---- Write Enable ----
-        self.cs_assert();
-        let _ = self.write_1bit_bytes_duplex(&[config::SPI_CMD_WRITE_ENABLE]);
-        self.cs_deassert();
+        let mut write_enable = false;
+        for _ in 0..2 {
+            self.cs_assert();
+            write_enable = self.write_1bit_bytes_duplex(&[config::SPI_CMD_WRITE_ENABLE]);
+            self.cs_deassert();
+            if write_enable {
+                break;
+            }
+            embassy_time::Timer::after_micros(50).await;
+        }
+        if !write_enable {
+            return Err(SpiError::PioTimeout);
+        }
         embassy_time::Timer::after_micros(1).await;
 
         // ---- Page Program ----
         self.cs_assert();
         self.configure_duplex1();
-        let _ = self.duplex1_write_read_byte_configured(opcode);
-        let _ = self.write_address_1bit_duplex_configured(address, addr_len);
-        let _ = self.write_1bit_bytes_duplex_configured(data);
+        let programmed = self.duplex1_write_read_byte_configured(opcode).is_some()
+            && self.write_address_1bit_duplex_configured(address, addr_len)
+            && self.write_1bit_bytes_duplex_configured(data);
         self.cs_deassert();
+        if !programmed {
+            // A failed duplex response does not reveal whether the last byte
+            // reached the flash. CS must be released to terminate the command;
+            // wait for any resulting partial program to become idle before the
+            // bus is handed back, while still reporting the operation failed.
+            embassy_time::Timer::after_micros(1_000).await;
+            let _ = self.poll_wip(&cancelled).await;
+            return Err(SpiError::PioTimeout);
+        }
 
         // ---- Wait for completion ----
         // Some emulators do not assert WIP quickly enough for an immediate status
@@ -683,98 +741,49 @@ impl<'d> SpiFlash<'d> {
         // start before polling so the following page's WREN/program sequence is
         // not ignored while the target is still internally busy.
         embassy_time::Timer::after_micros(1_000).await;
-        self.poll_wip().await;
+        self.poll_wip(&cancelled).await
     }
 
     /// Poll the flash status register until the WIP (Write In Progress) bit clears.
-    async fn poll_wip(&mut self) {
+    async fn poll_wip<F: Fn() -> bool>(&mut self, cancelled: &F) -> Result<(), SpiError> {
+        let deadline = Instant::now() + PAGE_PROGRAM_TIMEOUT;
         loop {
+            if cancelled() {
+                return Err(SpiError::Cancelled);
+            }
             self.cs_assert();
             self.configure_duplex1();
-            let _ = self.duplex1_write_read_byte_configured(config::SPI_CMD_READ_STATUS);
-            let status = self.duplex1_write_read_byte_configured(0).unwrap_or(0xff);
+            let status = self
+                .duplex1_write_read_byte_configured(config::SPI_CMD_READ_STATUS)
+                .and_then(|_| self.duplex1_write_read_byte_configured(0));
             self.cs_deassert();
 
+            let status = status.ok_or(SpiError::PioTimeout)?;
             if status & config::SPI_STATUS_WIP == 0 {
-                break;
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(SpiError::FlashBusyTimeout);
             }
 
             embassy_time::Timer::after_micros(50).await;
         }
     }
 
-    async fn wait_for_forced_busy_window(&mut self) {
-        loop {
-            match self.force_busy_until {
-                Some(until) if Instant::now() < until => {
-                    embassy_time::Timer::after_millis(1).await;
-                }
-                Some(_) => {
-                    self.force_busy_until = None;
-                    embassy_time::Timer::after_millis(25).await;
-                    break;
-                }
-                None => break,
+    fn check_forced_busy_window<F: Fn() -> bool>(&mut self, cancelled: &F) -> Result<(), SpiError> {
+        if cancelled() {
+            return Err(SpiError::Cancelled);
+        }
+
+        match self.force_busy_until {
+            Some(until) if Instant::now() < until => Err(SpiError::FlashBusy),
+            Some(_) => {
+                self.force_busy_until = None;
+                Ok(())
             }
+            None => Ok(()),
         }
     }
-}
-
-fn assemble_duplex_program(width: u8) -> pio::Program<32> {
-    let side_set = pio::SideSet::new(false, 1, false);
-    let mut a = pio::Assembler::<32>::new_with_side_set(side_set);
-    let mut wrap_target = a.label();
-    let mut wrap_source = a.label();
-
-    a.bind(&mut wrap_target);
-    // Five-cycle mode-0 bit cell tuned for 24 MHz. OUT drives MOSI during the
-    // two-cycle low phase; two high-side NOPs delay MISO sampling until late in
-    // the high phase, which avoids the 24 MHz bit-shift seen with earlier cells.
-    a.out_with_delay_and_side_set(pio::OutDestination::PINS, width, 1, 0);
-    a.nop_with_side_set(1);
-    a.nop_with_side_set(1);
-    a.r#in_with_side_set(pio::InSource::PINS, width, 1);
-    a.bind(&mut wrap_source);
-
-    a.assemble_with_wrap(wrap_source, wrap_target)
-}
-
-fn assemble_tx_program(width: u8) -> pio::Program<32> {
-    let groups_per_byte = 8 / width;
-    let side_set = pio::SideSet::new(false, 1, false);
-    let mut a = pio::Assembler::<32>::new_with_side_set(side_set);
-    let mut wrap_target = a.label();
-    let mut wrap_source = a.label();
-    let mut bitloop = a.label();
-
-    a.bind(&mut wrap_target);
-    a.pull_with_side_set(false, true, 0);
-    a.set_with_side_set(pio::SetDestination::X, groups_per_byte - 1, 0);
-    a.bind(&mut bitloop);
-    a.out_with_delay_and_side_set(pio::OutDestination::PINS, width, 1, 0);
-    a.jmp_with_delay_and_side_set(pio::JmpCondition::XDecNonZero, &mut bitloop, 2, 1);
-    a.bind(&mut wrap_source);
-
-    a.assemble_with_wrap(wrap_source, wrap_target)
-}
-
-fn assemble_rx_program(width: u8) -> pio::Program<32> {
-    let side_set = pio::SideSet::new(false, 1, false);
-    let mut a = pio::Assembler::<32>::new_with_side_set(side_set);
-    let mut wrap_target = a.label();
-    let mut wrap_source = a.label();
-
-    a.bind(&mut wrap_target);
-    // Read-only five-cycle bit cell matching the full-duplex sample phase. OUT
-    // NULL consumes one lane-group from OSR so autopull supplies one byte worth
-    // of clocks per TX FIFO word, while IN samples late in the SCK high phase.
-    a.out_with_delay_and_side_set(pio::OutDestination::NULL, width, 1, 0);
-    a.nop_with_side_set(1);
-    a.nop_with_side_set(1);
-    a.r#in_with_side_set(pio::InSource::PINS, width, 1);
-    a.bind(&mut wrap_source);
-
-    a.assemble_with_wrap(wrap_source, wrap_target)
 }
 
 fn erase_busy_duration(write_data: &[u8]) -> Option<Duration> {
